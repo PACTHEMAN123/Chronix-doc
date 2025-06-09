@@ -2,204 +2,74 @@
 
 = 内存管理
 
-== 物理内存管理
+== 内存分配器
 
-=== 内核动态内存分配器
+=== 页帧分配器
 
-Phoenix 使用伙伴分配器管理内核所需的动态内存结构，来自 crate
-`buddy_system_allocator`。
+使用了`BitmapAllocator`分配页帧。
 
-伙伴分配器（Buddy Allocator）是一种内存分配算法，常用于操作系统内核和高性能应用程序中，通过分配和管理内存块来满足不同大小的内存请求，并进行高效的合并和分割操作。其工作原理是将内存块按照 2 的幂次方大小分为多个层级，当需要分配特定大小的内存时，从最小适合该请求的层级开始查找。每个内存块都有一个“伙伴”块，如果块大小是 $2^k$，那么它的伙伴块也是 $2^k$ 且紧挨着它。通过检查和计算伙伴块的地址，可以快速地进行内存分割与合并。当需要分配的内存块小于当前可用最小块时，将当前块一分为二，直到找到合适大小的块为止；当释放一个内存块时，若其伙伴块也空闲，则将两个块合并为一个更大的块，递归进行直到不能再合并为止。伙伴分配器的优点在于分配和释放内存块的操作非常快速，且通过内存块大小的选择和合并操作，有效减少了外部碎片。
+=== Slab缓存分配器
 
-=== 物理页分配器
-
-内核还需要管理全部的空闲物理内存，Phoenix 为此使用了来自 rCore 的仓库的 `bitmap-allocator`。Phoenix 在内核初始化时，会将所有内核未占用的物理内存加入物理页分配器。
-
-Bitmap allocator 的主要原理是通过一个位图来管理一段连续的内存空间。这个位图中的每一位代表一块内存，如果该位为 0，说明对应的内存块空闲；如果该位为 1，说明对应的内存块已经被分配出去。当需要分配一个指定大小的内存时，bitmap allocator 首先检查位图中是否有足够的连续空闲内存块可以满足分配请求。如果有，就将对应的位图标记为已分配，并返回该内存块的起始地址；如果没有，就返回空指针，表示分配失败。当需要释放已经分配出去的内存时，bitmap allocator 将对应位图标记为未分配。这样，已经释放的内存块就可以被下一次分配请求使用了。
-
-此外，Phoenix 将物理页帧抽象成 `FrameTracker` 结构体，并结合 RAII 的思想，在结构体析构时自动调用 `dealloc_frame` 函数将页帧释放。
-
-```rust
-/// Manage a frame which has the same lifecycle as the tracker.
-pub struct FrameTracker {
-    /// PPN of the frame.
-    pub ppn: PhysPageNum,
-}
-
-impl Drop for FrameTracker {
-    fn drop(&mut self) {
-        dealloc_frame(self.ppn);
-    }
-}
-```
+自制Slab缓存，高效实现小对象分配和回收。
 
 == 地址空间
 
 === 地址空间布局
 
-Phoenix 地址空间的设计如下图所示：
+Chronix 地址空间的设计如下图所示：
 
 #img(
-    image("../assets/address-space.png"),
+    image("../assets/image/mm/address-space.svg"),
     caption: "地址空间"
 )<address_layout>
 
-Phonix 内核态页表保存在全局内核地址空间 `KERNEL_SPACE` 中，用户地址空间共享内核二级页表。
+Chronix 内核态页表保存在全局内核地址空间 `KVMSPACE` 中，用户地址空间共享内核二级页表。
 
 对于内核地址空间，为了方便管理所有物理地址，采用偏移映射的方式将物理地址以加上偏移量的方式映射为虚拟地址，即每一个虚拟地址都为对应物理地址加上`VIRT_RAM_OFFSET`。
 
-对于用户地址空间，为了利用分页机制的灵活性，消除外部碎片，采用随机映射的方式将需要的页随机映射到空闲物理内存中随机一块页帧。
+对于用户地址空间，为了利用分页机制的灵活性，消除外部碎片，采用随机映射的方式将虚拟页随机映射到空闲物理内存中任意一页。
+
+用户地址空间和内核地址空间互不重叠，意味着它们可以共用同一张页表。这种设计使得在内核可以方便地同时访问内核和用户的地址，而不用切换页表和刷新tlb，减少了系统调用的开销。
 
 === Boot 阶段高位映射
 
-在 QEMU 平台上，内核的入口地址位于 0x8020_0000。在 xv6 与 rCore-Tutorial 中，0x8020_0000 以上部分以直接映射的方式作为内核地址空间，0x8000_0000 以下部分以随机映射的方式作为用户程序地址空间。因此用户程序最多只有 2G 的地址空间，而考虑到 MMIO 也映射在低位，用户程序地址空间只会更少。因此，Phoenix 充分利用页表的灵活性，将内核地址空间以偏移映射的方式映射到 RISC-V SV39 规定的高位地址空间，即 0xFFFF_FFC0_0000_0000 至 0xFFFF_FFFF_FFFF_FFFF，每一个虚拟地址对应于物理地址加上一个相同的偏移量，而将用户地址空间映射到 0x0 至 0x3F_FFFF_FFFF。这样，用户地址空间不足的问题就被解决了。
+在RISCV平台，使用OpenSBI引导内核启动时，内核会被放置在一个固定的地址（Qemu中是0x8020_0000)，计算机开始执行内核代码时，pc也会指向这个地址。由于采用了地址空间偏移映射，而且目前的内核代码不是位置无关的，这会导致一些问题，例如在建立页表映射之前，内核使用了绝对地址寻址，而这个绝对地址还未被映射，就会导致致命错误。
 
-但是问题也随之而来，OpenSBI 会识别内核 ELF 文件入口地址的加载地址（LMA），然后在启动完毕后会跳转到此处，这时 RISC-V 页表机制还未开启，内核会直接访问物理地址。而开启页表时需要保证指令在启动页表前后物理地址连续，这就需要跳板页。Phoenix 希望在内核尽早映射到高位地址空间，这样在调试时能够尽早将代码与地址对应，因此 Phoenix 首先将内核虚拟地址链接到高位地址空间，将加载地址链接到低位，然后结合 RISC-V 巨页的机制，在内核启动阶段，在 Boot 页表中构造了三个巨页，地址分别为 0x8000_0000、0xFFFF_FFC0_0000_0000 和 0xFFFF_FFC0_8000_0000。其中，0x8000_0000 所在巨页作为跳板页，保证在打开页表前后 `pc` 寄存器指向连续的物理地址；0xFFFF_FFC0_0000_0000 所在巨页保存了 MMIO 的高位映射，以便在 Boot 页表阶段开启打印调试功能；0xFFFF_FFC0_8000_0000 所在巨页对应于内核 ELF 文件的虚拟地址高位映射，在 `_start` 函数最后会跳转到此处执行内核代码。在`entry.rs`代码执行完毕后，内核便成功执行在高位地址空间了，最后，Boot 页表会在 `main` 函数执行过程中被更加细化的全局内核页表 `KERNEL_SPACE` 所取代。
+为了解决这一问题，需要尽可能在使用绝对地址之前建立页表映射。因此，我们在内核中硬编码了一个页表，它只有几页巨页，负责在启动阶段实现临时的地址空间偏移映射。这个页表的定义如下：
 
 ```rust
-// arch/src/riscv64/entry.rs
-
-#[link_section = ".bss.stack"]
-static mut BOOT_STACK: [u8; KERNEL_STACK_SIZE * MAX_HARTS] =
-    [0u8; KERNEL_STACK_SIZE * MAX_HARTS];
-
 #[repr(C, align(4096))]
-struct BootPageTable([u64; PTES_PER_PAGE]);
+pub struct BootPageTable([u64; Constant::PTES_PER_PAGE]);
 
-static mut BOOT_PAGE_TABLE: BootPageTable = {
-    let mut arr: [u64; PTES_PER_PAGE] = [0; PTES_PER_PAGE];
+pub static mut BOOT_PAGE_TABLE: BootPageTable = {
+    let mut arr: [u64; Constant::PTES_PER_PAGE] = [0; Constant::PTES_PER_PAGE];
     arr[2] = (0x80000 << 10) | 0xcf;
     arr[256] = (0x00000 << 10) | 0xcf;
     arr[258] = (0x80000 << 10) | 0xcf;
     BootPageTable(arr)
 };
-
-#[naked]
-#[no_mangle]
-#[link_section = ".text.entry"]
-unsafe extern "C" fn _start(hart_id: usize, dtb_addr: usize) -> ! {
-    core::arch::asm!(
-        // 1. set boot stack
-        // sp = boot_stack + (hartid + 1) * 64KB
-        "
-            addi    t0, a0, 1
-            slli    t0, t0, 16              // t0 = (hart_id + 1) * 64KB
-            la      sp, {boot_stack}
-            add     sp, sp, t0              // set boot stack
-        ",
-        // 2. enable sv39 page table
-        // satp = (8 << 60) | PPN(page_table)
-        "
-            la      t0, {page_table}
-            srli    t0, t0, 12
-            li      t1, 8 << 60
-            or      t0, t0, t1
-            csrw    satp, t0
-            sfence.vma
-        ",
-        // 3. jump to rust_main
-        // add virtual address offset to sp and pc
-        "
-            li      t2, {virt_ram_offset}
-            or      sp, sp, t2
-            la      a2, rust_main
-            or      a2, a2, t2
-            jalr    a2                      // call rust_main
-        ",
-        boot_stack = sym BOOT_STACK,
-        page_table = sym BOOT_PAGE_TABLE,
-        virt_ram_offset = const VIRT_RAM_OFFSET,
-        options(noreturn),
-    )
-}
 ```
+
+arr[2]的页表项建立了一个从0x8000_0000到0x8000_0000大小为1GiB的全等映射，这是为了防止在启用页表到跳转之间pc失效。
+arr[256]的页表项建立了从0xffff_ffc0_0000_0000到0x0的大小为1GiB的偏移映射，这是为一些外设设置的。
+arr[258]的页表项建立了从0xffff_ffc0_8000_0000到0x8000_0000的大小为1GiB的偏移映射，这是映射了全部内核代码和数据。
+
+内核会在随后的启动流程中切换到一个更细致的页表代替这个临时页表。
+
+在龙芯平台，因为使用直接映射窗口代替页表映射，所有没有这样的麻烦。
 
 === 地址空间管理
 
-Phonix 使用 RAII 机制管理地址空间，主要使用`MemorySpace` 和 `VmArea` 以及 `RangeMap`数据结构。
-
-```rust
-/// Virtual memory space for kernel and user.
-pub struct MemorySpace {
-    /// Page table of this memory space.
-    page_table: PageTable,
-    /// Map of `VmArea`s in this memory space.
-    areas: RangeMap<VirtAddr, VmArea>,
-}
-
-/// A contiguous virtual memory area.
-pub struct VmArea {
-    /// Aligned `VirtAddr` range for the `VmArea`.
-    range_va: Range<VirtAddr>,
-    /// Hold pages with RAII.
-    pub pages: BTreeMap<VirtPageNum, Arc<Page>>,
-    /// Map permission of this area.
-    pub map_perm: MapPerm,
-    /// Type of this area.
-    pub vma_type: VmAreaType,
-
-    // For mmap.
-    /// Mmap flags.
-    pub mmap_flags: MmapFlags,
-    /// The underlying file being mapped.
-    pub backed_file: Option<Arc<dyn File>>,
-    /// Start offset in the file.
-    pub offset: usize,
-}
-
-/// A range map that stores range as key.
-pub struct RangeMap<U: Ord + Copy + Add<usize>, V>(BTreeMap<U, Node<U, V>>);
-```
+Chronix 使用 RAII 机制和多层抽象机制管理地址空间。
 
 == 缺页异常处理
 
-Phoenix 目前能够利用缺页异常处理来实现写时复制（Copy on write）、懒分配（Lazy page allocation）以及用户地址检查机制和零拷贝技术。
-
-当用户程序因缺页异常返回内核时，内核异常处理函数能够从 `stval` 寄存器读取异常发生的地址，并交给 `VmArea::handle_page_fault` 函数进行处理。
-
+Chronix 目前能够利用缺页异常处理来实现写时复制（Copy on write）、懒分配（Lazy page allocation）以及用户地址检查机制和零拷贝技术。
 
 === CoW 写时复制技术
 
-在 `fork` 进程时，Phoenix 会将原`MemorySpace`中的除共享内存外每一个已分配页的PTE都删除写标志位，打上COW标志位，然后重新映射到页表中，并将。在用户向COW页写入时会触发缺页异常陷入内核，在`VmArea::handle_page_fault`函数中，内核会根据COW标志位转发给COW缺页异常处理函数，缺页异常处理函数会根据`Arc<Page>`的原子持有计数判断是否为最后一个持有者，如果不是最后一个持有者，会新分配一个页并复制原始页的数据并恢复写标志位重新映射，如果是最后一个持有者，直接恢复写标志位。
+在 `fork` Chronix 会将原`MemorySpace`中的除共享内存外每一个已分配页的PTE都删除写标志位，然后重新映射到页表中，并将。用户向COW页写入时会触发缺页异常陷入内核，在`VmArea::handle_page_fault`函数中，内核会根据COW标志位转发给COW缺页异常处理函数，缺页异常处理函数会根据`StrongArc<FrameTracker>`的原子持有计数判断是否为最后一个持有者，如果不是最后一个持有者，会新分配一个页并复制原始页的数据并恢复写标志位重新映射，如果是最后一个持有者，直接恢复写标志位。
 
-```rust
-impl MemorySpace {
-    /// Clone a same `MemorySpace` lazily.
-    pub fn from_user_lazily(user_space: &mut Self) -> Self {
-        let mut memory_space = Self::new_user();
-        for (range, area) in user_space.areas().iter() {
-            let mut new_area = area.clone();
-            for vpn in area.range_vpn() {
-                if let Some(page) = area.pages.get(&vpn) {
-                    let pte = user_space
-                        .page_table_mut()
-                        .find_leaf_pte(vpn)
-                        .unwrap();
-                    let (pte_flags, ppn) = match area.vma_type {
-                        VmAreaType::Shm => {
-                            // no cow for shared memory
-                            new_area.pages.insert(vpn, page.clone());
-                            (pte.flags(), page.ppn())
-                        }
-                        _ => {
-                            // copy on write
-                            let mut new_flags = pte.flags() | PTEFlags::COW;
-                            new_flags.remove(PTEFlags::W);
-                            pte.set_flags(new_flags);
-                            (new_flags, page.ppn())
-                        }
-                    };
-                    memory_space.page_table_mut().map(vpn, ppn, pte_flags);
-                } else {
-                    // do nothing for lazy allocated area
-                }
-            }
-            memory_space.push_vma_lazily(new_area);
-        }
-        memory_space
-    }
-}
-```
 
 === 懒分配技术
 
@@ -207,46 +77,88 @@ impl MemorySpace {
 
 懒分配技术的核心思想是推迟实际物理内存的分配，直到进程真正访问到该内存区域。这样可以优化内存使用，提高系统性能。
 
-对于内存的懒分配，比如堆栈分配，mmap匿名内存分配，Phoenix将许可分配的范围记录下来，但并不进行实际分配操作，当用户访问到许诺分配但未分配的页面时会触发缺页异常，缺页异常处理函数会进行实际的分配操作。
+对于内存的懒分配，比如堆栈分配，mmap匿名内存分配，Chronix将许可分配的范围记录下来，但并不进行实际分配操作，当用户访问到许诺分配但未分配的页面时会触发缺页异常，缺页异常处理函数会进行实际的分配操作。
 
 
-对于mmap文件的懒分配，Phoenix将其与页缓存机制深度融合，Phoenix 同样执行懒分配操作，当缺页异常时再从页缓存中获取页面。
+对于mmap文件的懒分配，Chronix将其与页缓存机制深度融合，Chronix 同样执行懒分配操作，当缺页异常时再从页缓存中获取页面。
 
 
+=== 用户地址检查
 
-=== 用户地址检查与零拷贝技术
+内核的一些功能需要操作用户空间地址，比如sys_read就需要将文件内容写到位于用户空间的缓冲区中。
 
-在系统调用过程中，内核需要频繁与用户态指针指向的数据进行交互。在 Phonix 中，用户和内核共享地址空间，因此在访问用户态的内存时不需要同 xv6 那样通过软件查询页表，而是可以利用硬件页表机制直接解引用用户态指针。
+然而直接使用用户空间地址是不安全的，而内核为了节省空间和降低延迟，在用户空间使用了延迟分配和写时复制等技术，这意味着直接读写用户空间地址可能会引发缺页异常。
 
-然而，用户态指针并不总是有效的，有可能指向非法内存，出于安全性保证，内核需要能够捕获这种异常。在用户态下，无效指针解引用，或者向只读地址写入数据会触发缺页异常，陷入内核并执行相应缺页异常处理函数，通常，缺页异常处理函数会向程序发送 `SIGSEGV` 信号或者终止进程。而 Phoenix 内核态也需要解引用用户态的指针，因此内核也需要捕获并处理这种页错误。
+最大的风险就是死锁。内核在持有锁时常常会关闭外部中断，正是为了防止处理外部中断时重复加锁而导致死锁。然而，缺页中断属于不可屏蔽中断，不能像外部中断那样避免死锁，而延迟分配和写时复制等技术非常依赖缺页中断，就算使用某种方式屏蔽了缺页中断，对用户空间地址的读写依然不能正常进行。
 
-我们参考了往届 MankorOS 队伍的做法，借助硬件 MMU 部件的帮助实现了高效的用户指针检查。该做法的基本思路是，先将内核的异常捕捉函数替换为“用户检查模式”下的函数，然后直接尝试向目标地址读取或写入一个字节。若是目标地址发生了缺页异常，则内核将表现得如同用户程序发生了一次异常一般，进入用户缺页异常处理程序进行处理。若处理成功或目标地址访问成功，便可假定当前整个页范围内都是合法的用户地址空间，否则用户指针便不合法。该处理方法相当于直接利用了硬件 MMU 来检查用户指针是否可读或可写，在用户指针正常时速度极快，同时还能完全复用用户缺页异常处理的代码来处理用户指针懒加载/CoW 的情况。
+一种解决方法就是模拟MMU对用户空间地址进行检查，并在发现缺页时调用缺页异常处理程序尝试处理，确保内核访问用户空间地址时不会引发缺页。这也就是我们的用户指针的主要功能。
 
-此外，Phoenix 基于此实现了用户态指针内容的零拷贝技术，即内核态不需要软件模拟地址翻译并复制用户态指针指向的数据到内核态，而是可以直接访问用户态指针，避免用户态数据到内核态数据的拷贝。用户态传入的指针经过检查后，会被转换成 `UserRef`、`UserMut` 和 `UserSlice` 对象。每一个对象都存放具体的指针，并保存了 `SumGuard` 以获取内核态访问用户地址空间的权限。Phoenix 充分利用了 Rust 提供的类型机制，为上述对象实现了 `deref` 方法，使得在不改变外部函数签名的情况下，依然能保持 `sstatus`寄存器`sum` 位开启，直接访问用户地址空间。这种实现不仅高效，还极大缩短了代码量。例如，`sys_read` 函数只需短短3行代码，不仅实现了用户地址空间检查，还能将文件内容零拷贝直接填充到用户提供的缓冲区。
+==== 实现原理
 
+使用了“快速用户指针检查”技术。
+
+目前提供了UserPtr和UserSlice两种抽象。这里只解释UserPtr，UserSlice使用方法类似。
+
+==== 原始用户指针
+
+原始用户指针是对原始指针的直接包装，它实现了Clone，Copy和Send特征，但是不能直接读写，需要通过ensure_read或ensure_write转换成相应的可读/可读写用户指针。对用户空间地址的检查和缺页处理就发生在这些函数中。
+UserPtrRaw<u8>有一个特殊的方法cstr_slice，用来将用户提供的C字符串转换为u8数组。
+
+==== 可读写用户指针
+
+可读写用户指针会锁定其使用的页面，防止页面换出。析构时会自动取消锁定。
+
+=== 使用方法
+
+读用户指针
 ```rust
-/// User slice. Hold slice from `UserPtr` and a `SumGuard` to provide user
-/// space access.
-pub struct UserSlice<'a, T> {
-    slice: &'a mut [T],
-    _guard: SumGuard,
-}
+let task = current_task().unwrap();
+let user_ptr = 
+    UserPtrRaw::new(uaddr as *const TimeSpec)
+        .ensure_read(&mut task.vm_space.lock())
+        .unwarp();
+let time_val = *user_ptr.to_ref();
+```
 
-impl<'a, T> core::ops::DerefMut for UserSlice<'a, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.slice
-    }
-}
+写用户指针
+```rust
+let task = current_task().unwrap();
+let user_ptr = UserPtrRaw::new(uaddr as *mut Tms)
+    .ensure_write(&mut task.vm_space.lock())
+    .unwarp();
+let current_task = current_task().unwrap();
+let tms_val = Tms::from_time_recorder(current_task.time_recorder());
+user_ptr.write(tms_val);
+```
 
-pub async fn sys_read(
-    &self,
-    fd: usize,
-    buf: UserWritePtr<u8>,
-    count: usize,
-) -> SyscallResult {
-    let file = self.task.with_fd_table(|table| table.get_file(fd))?;
-    let mut buf: UserSlice<'_, u8> = buf.into_mut_slice(&task, count)?;
-    file.read(&mut buf).await
-}
+读用户缓冲区
+```rust
+let task = current_task().unwrap();
+let user_buf = 
+    UserSliceRaw::new(buf as *mut u8, len)
+        .ensure_write(&mut task.vm_space.lock())
+        .unwarp();
+let ret = file.read(user_buf.to_mut()).await?;
+```
+
+写用户缓冲区
+```rust
+let task = current_task().unwrap();
+let user_buf = 
+    UserSliceRaw::new(buf as *mut u8, len)
+        .ensure_read(&mut task.vm_space.lock())
+        .unwarp();
+let ret = file.write(user_buf.to_mut()).await?;
+```
+
+将用户提供的c式字符串转为String
+```rust
+let task = current_task().unwrap();
+user_cstr // UserPtrRaw<u8>
+    .cstr_slice(&mut task.vm_space.lock()) // Option<UserSlice<u8, ReadMark>>
+    .unwarp() // UserSlice<u8, ReadMark>
+    .to_str() // Result<&str, str::Utf8Error>
+    .unwarp() // &str
+    .to_string() // String
 ```
 
