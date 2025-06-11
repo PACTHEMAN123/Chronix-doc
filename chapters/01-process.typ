@@ -8,6 +8,153 @@
 
 == 任务控制块（TaskControlBlock）设计
 
+=== 内容结构设计
+
+Chronix基于rcore ch6进行开发，其原始设计明确区分设计了`Process`和`Thread`两个结构分别表示进程与线程。但是Linux内核对task这一单位结构的实现更具启发性：它并未严格区分进程和线程，而是通过统一的 API（如 sys_clone，sys_clone 通过传递不同的 flags 参数来控制新任务与父任务共享哪些资源，包括创建线程还是进程）来管理任务。其次rcore设计中使用了`TaskControlBlockInner`这一结构体来包装内部可变内容，并使用一把大锁来保护内部可变性。但是这样的设计往往降低运行效率，因为大锁的开销很大。这也启示着Chronix细分任务中的字段，以提高运行效率
+
+综上所述Chronix参考Linux采用统一的TaskControlBlock（TCB）表示任务将其作为调度的基本单元，并在此基础上进行扩展，增加了一些新的字段并将字段分类，其具体设计如下：
+
+```rust
+/// Task 
+pub struct TaskControlBlock {
+    // ! immutable
+    /// task id
+    pub tid: TidHandle,
+    /// leader of the thread group
+    pub leader: Option<Weak<TaskControlBlock>>,
+    /// whether this task is the leader of the thread group
+    pub is_leader: bool,
+    // ! mutable only in self context , only accessed by current task
+    pub trap_context: UPSafeCell<TrapContext>,
+    /// waker for waiting on events
+    pub waker: UPSafeCell<Option<Waker>>,
+    /// address of task's thread ID
+    pub tid_address: UPSafeCell<TidAddress>,
+    /// time recorder for a task
+    pub time_recorder: UPSafeCell<TimeRecorder>,
+    /// Futexes used by the task.
+    pub robust: UPSafeCell<UserPtrRaw<RobustListHead>>,
+    // ! mutable only in self context, can be accessed by other tasks
+    /// exit code of the task
+    pub exit_code: AtomicUsize,
+    /// ELF file the task executes
+    pub elf: Shared<Option<Arc<dyn File>>>,
+    #[allow(unused)]
+    /// base address of the user stack, can be used in thread create
+    pub base_size: AtomicUsize,
+    /// status of the task
+    pub task_status: SpinNoIrqLock<TaskStatus>,
+    // ! mutable in self and other tasks
+    /// virtual memory space of the task
+    pub vm_space: Shared<UserVmSpace>,
+    /// parent task
+    pub parent: Shared<Option<Weak<TaskControlBlock>>>,
+    /// child tasks
+    pub children: Shared<BTreeMap<Pid, Arc<TaskControlBlock>>>,
+    /// file descriptor table
+    pub fd_table: Shared<FdTable>,
+    /// thread group which contains this task
+    pub thread_group: Shared<ThreadGroup>,
+    /// process group id
+    pub pgid: Shared<PGid>,
+    /// use signal manager to handle all the signal
+    pub sig_manager: Shared<SigManager>,
+    /// pointer to user context for signal handling.
+    pub sig_ucontext_ptr: AtomicUsize, 
+    /// current working dentry
+    pub cwd: Shared<Arc<dyn Dentry>>,
+    /// Interval timers for the task.
+    pub itimers: Shared<[ITimer; 3]>,
+    #[cfg(feature = "smp")]
+    /// sche_entity of the task
+    pub sche_entity: Shared<TaskLoadTracker>,
+    /// the cpu allowed to run this task
+    pub cpu_allowed: AtomicUsize,
+    /// the processor id of the task
+    pub processor_id: AtomicUsize,
+}
+```
+
+Chronix将字段分为若干类：
+
++ #strong[不可变字段]： 这些字段自任务诞生后到任务被回收都不会改变，代表任务的基本标识信息，包括`tid`(任务ID),`leader`(线程组主任务弱引用)，`is_leader`: 是否为主任务的标识
+
++ #strong[任务内可变，不可被其他线程访问的字段]： 这些字段仅在任务内可访问改变，且仅在任务内访问改变。这样的内容可以只需要用`UPSafeCell`(包装的线程安全的UnSafeCell),而非相对低效的自旋锁包装。这样在保证数据安全性的情况下最大化提升了性能。这类字段包括：
+    - `trap_context`(任务内陷阱上下文)
+    - `waker`(任务内唤醒器)
+    - `tid_address`(任务内线程ID地址)
+    - `time_recorder`(任务内时间记录器)
+    - `robust`(任务内futex列表)
+
++ #strong[任务内可变，可被其他线程访问&修改的字段]： 这些字段仅在任务内可访问改变，且可被其他任务访问。为了原子安全性这类任务需要用原子变量(*`atomic variable`*)或者*`Share<T>`*包装。 `Shared<T>`也即`Arc<SpinNoIrqLock<T>>`，用于在多线程环境下安全访问共享数据,`Arc`为rust提供的原子引用计数智能指针，维护共享数据的引用计数从而在多个所有者共享统一数据是保证数据安全， `SpinNoIrqLock`为自旋锁，用于在中断禁用情况下短时间锁定保证原子性。
+
+这类字段包括：
+    - `exit_code`(任务内退出码)
+    - `elf`(任务内ELF文件)
+    - `base_size`(任务内用户栈基址)
+    - `task_status`(任务状态)
+    - `vm_space`(任务内虚拟内存空间)
+    - `parent`(任务内父任务弱引用)
+    - `children`(任务内子任务映射表)
+    - `fd_table`(任务内文件描述符表)
+    - `thread_group`(任务内线程组)
+    - `pgid`(任务内进程组ID)
+    - `sig_manager`(任务内信号管理器)
+    - `sig_ucontext_ptr`(任务内信号上下文指针)
+    - `cwd`(任务内当前工作目录)
+    - `itimers`(任务内间隔定时器)
+    - `sche_entity`(任务内调度实体)
+    - `cpu_allowed`(任务内允许运行的CPU掩码)
+    - `processor_id`(任务内处理器ID)
+
+=== 进程&线程的统一与区分
+
+如上章所言，Chronix将进程和线程统一为“任务”（taskcontrolblock），通过统一的API操作，达到简洁有效的统一管理。Chronix中进程和线程的创建、调度、销毁、状态查询等操作都通过`TaskControlBlock`来实现。区分进程与线程通过以下操作。
+
+进程任务在Chronix中被标记为`leader`,是`thread_group`(线程组)的第一个任务&主任务。进程任务的`tid`(task_id)被设置为线程组的`tgid`(thread_group_id)。当新创建一个进程时,`thread_group` 仅有进程本身这个成员, TaskControlBlock 的 `is_leader` 字段设为 True 。子进程建立对parent的弱引用,父进程在children中添加子进程的引用。注意子进程诞生后作为独立的进程并不继承父进程的thread_group, 而是新建一个目前仅包含自己的thread_group。
+
+线程在当 sys_clone 设置 CLONE_THREAD 标志位时诞生。子线程将复制父线程thread_group并将自己添加进去。`is_leader`字段设为false，表示不是主任务。
+同时设置`leader`。 进程相关字段(parent,childern)继承自leader。
+
+Chronix ThreadGroup结构体定义如下：
+
+```rust
+pub struct ThreadGroup {
+    members: BTreeMap<Tid, Weak<TaskControlBlock>>,
+    alive: usize,
+    pub group_exiting: bool,
+    pub group_exit_code: usize,
+}
+```
+
+每个ThreadGroup包含一个BTreeMap将线程组任务标识号tid与主任务的弱引用关联起来。alive字段记录当前线程组中存活的任务数量。group_exiting字段表示线程组是否正在退出，group_exit_code字段表示线程组退出时的退出码。后三者保障线程回收过程的正确进行。
+
+=== 任务状态
+
+Chronix中为贴合可能出现的任务状态设计了多类`TaskStatus`枚举，包括：
+
+#align(center)[#table(
+  columns: 2,
+  align: (col, row) => (auto,auto,).at(col),
+  inset: 10pt,
+  [状态], [含义],
+  [`Ready`],
+  [任务已准备就绪，可以被调度。],
+  [`Running`],
+  [正在运行的任务。此状态下，任务占用 CPU，执行其代码。],
+  [`Zombie`],
+  [任务已终止，但其进程控制块 (PCB),仍然存在，以便父进程可以读取其退出状态。会最终退出调度循环在`handle_zombie`函数中被释放回收。],
+  [`Stopped`],
+  [任务已停止运行，通常是由于接收到停止信号（如
+  `SIGSTOP`）。可以通过特定信号（如 `SIGCONT`）恢复运行。在调度中会被悬挂直到被唤醒。],
+  [`Interruptable`],
+  [任务处于可中断的等待状态，等待某个事件（如 I/O
+  操作完成或资源释放）。此状态下，任务可以被信号中断并唤醒。],
+  [`UnInterruptable`],
+  [任务处于不可中断的等待状态，等待某个事件的发生。此状态下，任务不会被信号中断，以确保某些关键操作的完整性和原子性。],
+)
+]
+
 == 任务调度
 
 === 异步无栈协程
@@ -84,6 +231,129 @@ impl <F:Future+Send+'static> Future for UserTaskFuture<F> {
 - _任务完成_：Future的poll方法返回`Poll::Ready`，表示任务进入运行，调度器将任务从队列中移除，开始任务运行，直到触发时钟中断后调用任务内置wake函数，再次进入TaskQueue,开启新一轮调度周期
 
 - _任务挂起_：Future的poll方法返回`Poll::Pending`，Future直到下次遇见.awaits时或者自己的`waker`显式被调用唤醒，调度器将任务重新放回队列，等待下次调度。
+
+== 中断异常管理
+
+中断与异常是计算机系统中极为重要的控制机制，它们使处理器能够灵活地应对各种内部或外部事件，从而保证系统的可靠性、响应性与多任务处理能力。
+
+- *中断（Interrupt）*通常由外部设备产生，用于异步通知处理器某些事件的发生，如键盘输入、定时器到时或网络数据到达。当中断发生时，处理器会暂时中止当前程序的执行，转而运行对应的中断服务程序（ISR），完成事件处理后再恢复原程序的执行。这种机制使得计算机能及时响应外部世界的变化，是实现外设驱动和操作系统调度的基础。
+
+- *异常（Exception）*则是由处理器在执行指令过程中检测到的错误或特殊情况，如除以零、非法内存访问或系统调用请求。异常通常发生在程序内部，处理器会根据异常类型跳转到对应的异常处理例程，执行必要的修复、终止或内核服务操作。异常处理是系统稳定运行和程序安全的重要保障。
+
+中断与异常虽然来源不同，但都通过打断当前控制流、进入内核或特权模式来完成对系统资源的控制与协调，是操作系统与硬件协作的核心机制之一。
+
+在Chronix的内核用户态切换过程中，中断上下文保存在`TrapContext`数据结构中，保证用户态和内核态的正确切换。其中TrapContext以及TrapContextHal将在ChronixHal中详细介绍。
+
+Chronix中，任务的生命周周期就是在如下代码所示，唤醒后由内核态到用户态又到内核态（中断处理）的循环，直到task被设置为zombie状态退出循环，check_and_handle执行信号处理函数,任务最终在waitpid中被回收。
+
+```rust
+///The main part of process execution and scheduling
+///Loop `fetch_task` to get the process that needs to run, and switch the process 
+pub async fn run_tasks(task: Arc<TaskControlBlock>) {  
+    //info!("into run_tasks");
+    task.set_waker(get_waker().await);
+    /*info!(
+        "into task loop, sepc {:#x}, trap cx addr {:#x}",
+        current_task().unwrap().inner_exclusive_access().get_trap_cx().sepc,
+        current_task().unwrap().inner_exclusive_access().get_trap_cx() as *const TrapContext as usize,
+    );*/
+    let mut is_interrupted = false;
+    loop {
+        // check current task status before return
+        match task.get_status() {
+            TaskStatus::Zombie => break,
+            TaskStatus::Stopped => suspend_now().await,
+            _ => {}
+        }
+
+        // return to user space and return back from user space
+        trap_return(&task, is_interrupted);
+
+        // task status might be change by other task
+        match task.get_status() {
+            TaskStatus::Zombie => break,
+            TaskStatus::Stopped => suspend_now().await,
+            _ => {}
+        }
+
+        let cx = task.get_trap_cx();
+        let old_a0 = cx.ret_nth(0);
+        // back from user space
+        is_interrupted = user_trap_handler().await;
+
+        // check current task status after return
+        // task status maybe already change
+        match task.get_status() {
+            TaskStatus::Zombie => break,
+            TaskStatus::Stopped => suspend_now().await,
+            _ => {}
+        }
+
+        task.check_and_handle(is_interrupted, old_a0);
+    }
+}
+```
+
+=== 用户态 => 内核态
+
+用户态切换到内核态发生在以下几种情况：
+
+- 系统调用：当用户态进程发起系统调用时，会触发系统调用指令，陷入内核态，执行系统调用的内核函数。
+
+- 异常：当发生除零错误、非法内存访问或其他异常时，处理器会产生异常，陷入内核态，执行相应的异常处理程序。
+
+- 中断：当外部设备产生中断时，处理器会向CPU发出中断信号，CPU响应中断，将控制权转移到内核态，执行相应的中断处理程序。
+
+Chronix中以上情况由user_trap_handler函数处理,当从用户态陷入内核态时,会进入`set_kernel_trap_entry()`保存用户态的上下文,并准备好内核态的环境。接着进入 trap_handler 函数根据不同的陷阱类型进行处理:
+    - 系统调用：设置spec， 调用内核中的系统调用处理函数，倘若系统调用返回`EINTR`则会提示内核check_and_handle函数处理信号。
+    - 页面错误：调用 handle_page_fault 函数
+    - 非法指令&断点：分别向当前任务发送信号`SIGILL`和`SIGTRAP`，由check_and_handle函数处理。
+    - 定时中断：让出处理器等待下次调度。
+    - 外部中断：调用中断处理器处理
+
+=== 内核态 => 用户态
+
+Chronix内核态到用户态由trap_return函数完成。
+
+```rust
+#[no_mangle]
+/// set the new addr of __restore asm function in TRAMPOLINE page,
+/// set the reg a0 = trap_cx_ptr, reg a1 = phy addr of usr page table,
+/// finally, jump to new addr of __restore asm function
+pub fn trap_return(task: &Arc<TaskControlBlock>, _is_intr: bool) {
+    unsafe {
+        Instruction::disable_interrupt();  
+    }
+    set_user_trap_entry();
+    
+    task.time_recorder().record_trap_return();
+
+    let trap_cx = task.get_trap_cx();
+
+    // handler the signal before return
+    // task.check_and_handle(is_intr);
+
+    // restore float pointer and set status
+    trap_cx.fx_restore();
+    
+    Instruction::set_float_status_clean();
+    // restore
+    hal::trap::restore(trap_cx);
+    
+    trap_cx.mark_fx_save();
+
+    // set up time recorder for trap
+    task.time_recorder().record_trap();
+    // info!("[in record trap] task id: {}kernel_time:{:?}",task.tid(),task.time_recorder().kernel_time());
+}
+```
+
+首先禁用中断保证上下文切换的原子性，调用 set_user_trap_entry() 函数设置陷阱处理函数,以确保下一次从用户态陷入内核态时能够正确处理。返回用户台前TrapContext 的地址存储在 sscratch 寄存器中, a0 寄存器指向TrapContext。再保存内核态的寄存器,切换栈指针并恢复状态寄存器、通用寄存器、用户态指针,与浮点指针。最后使用 sret 指令返回用户态。
+
+=== 内核态 => 内核态
+
+// todo: 扩充此部分
+Chronix内核态允许嵌套中断，内核态发生中断后将保存调用者保存的寄存器，调用陷阱处理函数，恢复调用者保存寄存器最终返回。
 
 == 多核心管理
 
