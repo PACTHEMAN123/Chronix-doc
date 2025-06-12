@@ -37,10 +37,13 @@ pub struct Ext4T {
 pub trait T {
     fn method1() -> usize;
     fn method2() -> u64;
+    fn method3(&self) -> usize {
+        self.number + 1
+    }
 }
 ```
 
-这些方法，需要新的文件系统（假设新的文件系统同上，是 Ext4）来实现：
+这些方法中， method 1、2需要新的文件系统（假设新的文件系统同上，是 Ext4）来实现：
 
 ```rust
 impl T for Ext4T {
@@ -56,11 +59,45 @@ impl T for Ext4T {
 }
 ```
 
+而 method3 新的文件系统可以选择使用默认操作，或者自行实现以重载函数。
+
 简单来说：可以认为我们的 VFS 层为具体的文件系统提供了各个对象的#underline[模版] ，具体的文件系统需要根据模版实现#underline[具体的对象]。这样，内核或者 VFS 其他的对象，可以通过 `dyn` 的方式使用各个文件系统的具体对象的统一的接口。接下来会介绍各个对象在 VFS 中的作用
 
 === FSType
 
-(todo)
+在 Linux 内核的虚拟文件系统（VFS）架构中，file_system_type 是 每种文件系统实现的注册入口，是连接内核 VFS 与具体文件系统实现的桥梁。Chronix 参照了该设计，做出了一些简化。
+
+```rust
+pub struct FSTypeInner {
+    /// name of the file system type
+    name: String,
+    /// the super blocks
+    pub supers: SpinNoIrqLock<BTreeMap<String, Arc<dyn SuperBlock>>>,
+}
+```
+
+`FSType` 负责了一类文件系统的管理，比如所有的 `Ext4` 文件系统都会用 Ext4FStype 来管理。supers 字段维护了具体的文件系统实例。
+
+```rust
+pub trait FSType: Send + Sync {
+    /// get the base fs type
+    fn inner(&self) -> &FSTypeInner;
+    /// mount a new instance of this file system
+    fn mount(&'static self, name: &str, parent: Option<Arc<dyn Dentry>>, flags: MountFlags, dev: Option<Arc<dyn BlockDevice>>) -> Option<Arc<dyn Dentry>>;
+    /// shutdown a instance of this file system
+    fn kill_sb(&self) -> isize;
+    /// get the file system name
+    fn name(&self) -> &str;
+    /// use the mount path to get the super block
+    fn get_sb(&self, abs_mount_path: &str) -> Option<Arc<dyn SuperBlock>>;
+    /// get the static superblock
+    fn get_static_sb(&'static self, abs_mount_path: &str) -> &'static Arc<dyn SuperBlock>;
+    /// add a new super block
+    fn add_sb(&self, abs_mount_path: &str, super_block: Arc<dyn SuperBlock>);
+}
+```
+
+通过这些接口，我们可以快速将新的文件系统挂载到已有的文件系统下。
 
 === SuperBlock
 
@@ -82,8 +119,6 @@ pub struct SuperBlockInner {
 - `fs_type`：表示该超级块所对应的文件系统类型。
 - `root`：代表该文件系统的根目录项。使用 `Once` 是为了延迟初始化，确保挂载成功后根目录才能设置，防止重复或未定义的赋值。
 
-当前结构专注于 VFS 必需信息，但未来可以扩展如 `mount_flags`、`super_operations` 等字段。它描述了一个文件系统的全局状态和基本接口。它屏蔽了底层实现差异，统一了对挂载点、块设备、根目录等的访问方式，是构建模块化、可扩展 VFS 的基础。
-
 
 === Dentry
 
@@ -93,7 +128,7 @@ pub struct SuperBlockInner {
 
 当我们试图获取一个具体路径的 `Inode`，会先获取该路径对应的 `Dentry`，再通过 `Dentry` 访问对应的 `Inode` 。 `Dentry` 的设计，使得路径和 `Inode` 解耦。同时，我们会使用 `DCache` 来缓存路径和 `Dentry` 的转换，从而加快查找速度。
 
-基类设计如下：
+Dentry 基类设计如下：
 
 ```rust
 /// basic dentry object
@@ -117,6 +152,86 @@ pub struct DentryInner {
 - `children`：记录当前的 `Dentry` 的子节点，这个设计，是为了支持在一个文件系统下挂载不同的文件系统，以及不同类型的 `Dentry` 自由组合。
 - `state`：我们仿照 linux 的设计：Dentry 会有3种状态：`USED` `UNUSED` `NEGATIVE` 。在 Dentry 初始化时，状态为 `UNUSED`。在 Dentry 指向一个有效的 `Inode` 时，其状态为 `USED`。在 Dentry 的路径指向了一个无效的 `Inode` 时（Inode已经不存在了，或者不在该路径了），其状态为 `NEGATIVE`。`NEGATIVE` 状态的设计，使得我们在查询路径时，当遇到非法路径时可以尽早返回，避免重复查询文件系统。
 
+使用 rust 的 dyn 对象的机制，Dentry 可以做到自由组合：即一个文件系统下的 Dentry 的 parent 或者 children 可以来自其他的文件系统。得益于这个机制，我们可以在 VFS 层就完成路径的解析、寻找。只需要对应的文件系统实现以下的方法：
+
+```rust
+/// dentry method that all fs need to implement
+pub trait Dentry: Send + Sync {
+    /// get the inner dentry
+    fn dentry_inner(&self) -> &DentryInner;
+    /// open the inode it points as File
+    fn open(self: Arc<Self>, _flags: OpenFlags) -> Option<Arc<dyn File>>;
+    /// get the inode it points to
+    fn inode(&self) -> Option<Arc<dyn Inode>>;
+    /// set the inode it points to
+    fn set_inode(&self, inode: Arc<dyn Inode>);
+    /// clear the inode, now it doesnt have a inode
+    fn clear_inode(&self);
+    /// tidier way to get parent
+    fn parent(&self) -> Option<Arc<dyn Dentry>>;
+    /// get all children
+    fn children(&self) -> BTreeMap<String, Arc<dyn Dentry>>;
+    /// get a child
+    fn get_child(&self, name: &str) -> Option<Arc<dyn Dentry>>;
+    /// add a child
+    fn add_child(&self, child: Arc<dyn Dentry>);
+    /// remove a child
+    fn remove_child(&self, name: &str);
+    /// tider way to get name
+    fn name(&self) -> &str;
+    /// get the state
+    fn state(&self) -> DentryState;
+    /// set the state
+    fn set_state(&self, state: DentryState);
+    /// determine if negative dentry
+    fn is_negative(&self) -> bool;
+    /// get the absolute path of the dentry
+    fn path(&self) -> String;
+    /// load all child dentry 
+    /// can also be use to update
+    /// since the on-disk fs dentry dont know child until lookup by inode
+    /// we assert that only dir dentry will call this method
+    /// it will insert into DCACHE by the way
+    fn load_child_dentry(self: Arc<Self>) -> Result<Vec<Arc<dyn Dentry>>, SysError>;
+    /// create a negative child which share the same type with self
+    fn new_neg_dentry(self: Arc<Self>, _name: &str) -> Arc<dyn Dentry>;
+}
+```
+
+接下来我们就可以在 VFS 层实现以下路径查找的方法：
+
+```rust
+impl dyn Dentry {
+    
+    /// find the dentry by given path
+    /// first look up the dcache
+    /// if missed, try to search, start from this dentry
+    /// only return USED dentry, panic on invalid path
+    pub fn find(self: &Arc<Self>, path: &str) -> Result<Option<Arc<dyn Dentry>>, SysError>;
+
+    /// walk and search the dentry using the given related path(ex. a/b/c)
+    /// construct the dentry tree along the way
+    /// walk start from the current entry, recrusivly
+    /// once find the target dentry or reach unexisted path, return
+    /// if find, should return a USED dentry
+    /// if not find, should return a NEGATIVE dentry
+    pub fn walk(self: Arc<Self>, path: &str) -> Result<Arc<dyn Dentry>, SysError>;
+
+    /// follow the link and jump until reach the first NOT link Inode or reach the max depth
+    pub fn follow(self: Arc<Self>) -> Result<Arc<dyn Dentry>, SysError>;
+}
+```
+
+=== DCache
+
+DCACHE，即 Dentry Cache，专门用于缓存路径，避免发生多次查找重复路径。
+
+```rust
+pub static DCACHE: SpinNoIrqLock<BTreeMap<String, Arc<dyn Dentry>>> = 
+    SpinNoIrqLock::new(BTreeMap::new());
+```
+
+DCACHE 将绝对路径与对应的 Dentry 进行映射。每次当我们试图查询路径时，会先试着在 DCACHE 中寻找。这个策略可以大大加速一些经常性事件。
 
 
 === Inode
@@ -189,6 +304,9 @@ ext4（Fourth Extended Filesystem） 是 Linux 上广泛使用的日志型文件
 - `Ext4File`: Ext4 实现的 File 对象，注意和 lwext4_rust 向上提供的 Ext4File 并非同一个东西。
 
 (todo: how we change lwext4_rust)
+
+1. how to mount
+2. how to deal with page cache? data-inconsistency?
 
 == 非磁盘文件系统
 
