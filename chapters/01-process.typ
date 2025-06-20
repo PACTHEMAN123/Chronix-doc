@@ -222,7 +222,7 @@ impl <F:Future+Send+'static> Future for UserTaskFuture<F> {
    }
    ```
 #img(
-    image("../assets/image/task/Scheduling-process.png"),
+    image("../assets/image/task/Scheduling-process.svg"),
     caption: "Chronix基于协程的任务调度模型",
 )
 
