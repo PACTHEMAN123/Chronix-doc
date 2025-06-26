@@ -1,7 +1,7 @@
 // modified from https://github.com/werifu/HUST-typst-template
 
 #let heiti = ("Noto Sans CJK SC", "SimHei","Times New Roman")
-#let songti = ("Noto Serif CJK SC", "SimSun", "Times New Roman")
+#let songti = ("Times New Roman", "Noto Serif CJK SC", "SimSun")
 #let zhongsong = ("Noto Serif CJK SC", "SimSun", "Times New Roman")
 #let mono = ("FiraCode Nerd Font Mono", "Consolas", "Noto Serif CJK SC", "SimSun")
 
