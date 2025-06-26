@@ -2,13 +2,22 @@
 
 = 文件系统
 
-== Virtual File System
+== 虚拟文件系统
 
 Chronix 的虚拟文件系统总体架构如下图所示：
 
-(add photos here)
+#img(
+    image("../assets/image/fs/fs-overview.svg"),
+    caption: "文件系统总览"
+)<file_system_overview>
 
-虚拟文件系统（Virtual File System）为内核中的其他模块提供了文件系统的抽象。一个新的文件系统只需要实现 VFS 的方法和对象（见后文），就可以被内核其他模块使用。
+虚拟文件系统（Virtual File System）为内核中的其他模块提供了文件系统的抽象。一个新的文件系统只需要实现 VFS 的方法和对象（见后文），就可以被内核其他模块使用。虚拟文件系统由以下几个抽象层组成：
+
+- #strong[File System Layer]：用 `FSType` 以及 `FS_Manager` 来管理多个文件系统类型。一个文件系统类型可能会有多个文件系统实例。比如可能会有两个 Ext4 文件系统实例（挂载）。这一层会为一个类型的文件系统实现通用的挂载、解除挂载、查找挂载点等操作。
+- #strong[Super Block Layer]：用 `SuperBlock` 来管理一个具体的文件系统实例。超级块会为上层提供 `Inode` 以供访问文件系统的具体资源。
+- #strong[Inode Layer]：用 `Inode` 来管理一个文件系统里的“资源”。可能是文件、可能是目录、可能是设备 等等。注意 Inode 是资源的*独一无二*的映射。
+- #strong[Dentry Layer]：用 `Dentry` 以及 `DCache` 来管理路径到具体`Inode`的映射。一个 `Dentry` 只可能对应一个 `Inode`，而一个`Inode`可以对应多个`Dentry`。
+- #strong[File Layer]：可以视作 `Dentry` 在进程上的映射，使用 `File`以及`FdTable` 来管理。一个 `Dentry` 可以被多个 `File` 映射。
 
 
 === 对象设计
@@ -124,7 +133,10 @@ pub struct SuperBlockInner {
 
 在 Chronix 中，如果将文件系统的路径访问看作是一颗树，那么`Dentry` 可以看成其中的节点。
 
-(Add photos here)
+#img(
+    image("../assets/image/fs/dentry.svg"),
+    caption: "Dentry 路径前缀树"
+)<dentry_path_trie>
 
 当我们试图获取一个具体路径的 `Inode`，会先获取该路径对应的 `Dentry`，再通过 `Dentry` 访问对应的 `Inode` 。 `Dentry` 的设计，使得路径和 `Inode` 解耦。同时，我们会使用 `DCache` 来缓存路径和 `Dentry` 的转换，从而加快查找速度。
 
@@ -152,7 +164,7 @@ pub struct DentryInner {
 - `children`：记录当前的 `Dentry` 的子节点，这个设计，是为了支持在一个文件系统下挂载不同的文件系统，以及不同类型的 `Dentry` 自由组合。
 - `state`：我们仿照 linux 的设计：Dentry 会有3种状态：`USED` `UNUSED` `NEGATIVE` 。在 Dentry 初始化时，状态为 `UNUSED`。在 Dentry 指向一个有效的 `Inode` 时，其状态为 `USED`。在 Dentry 的路径指向了一个无效的 `Inode` 时（Inode已经不存在了，或者不在该路径了），其状态为 `NEGATIVE`。`NEGATIVE` 状态的设计，使得我们在查询路径时，当遇到非法路径时可以尽早返回，避免重复查询文件系统。
 
-使用 rust 的 dyn 对象的机制，Dentry 可以做到自由组合：即一个文件系统下的 Dentry 的 parent 或者 children 可以来自其他的文件系统。得益于这个机制，我们可以在 VFS 层就完成路径的解析、寻找。只需要对应的文件系统实现以下的方法：
+使用 `rust` 的 `dyn` 对象的机制，`Dentry` 可以做到自由组合：即一个文件系统下的 `Dentry` 的 `parent` 或者 `children` 可以来自其他的文件系统。得益于这个机制，我们可以在 VFS 层就完成路径的解析、寻找。只需要对应的文件系统实现以下的方法：
 
 ```rust
 /// dentry method that all fs need to implement
@@ -188,10 +200,6 @@ pub trait Dentry: Send + Sync {
     /// get the absolute path of the dentry
     fn path(&self) -> String;
     /// load all child dentry 
-    /// can also be use to update
-    /// since the on-disk fs dentry dont know child until lookup by inode
-    /// we assert that only dir dentry will call this method
-    /// it will insert into DCACHE by the way
     fn load_child_dentry(self: Arc<Self>) -> Result<Vec<Arc<dyn Dentry>>, SysError>;
     /// create a negative child which share the same type with self
     fn new_neg_dentry(self: Arc<Self>, _name: &str) -> Arc<dyn Dentry>;
@@ -202,13 +210,6 @@ pub trait Dentry: Send + Sync {
 
 ```rust
 impl dyn Dentry {
-    
-    /// find the dentry by given path
-    /// first look up the dcache
-    /// if missed, try to search, start from this dentry
-    /// only return USED dentry, panic on invalid path
-    pub fn find(self: &Arc<Self>, path: &str) -> Result<Option<Arc<dyn Dentry>>, SysError>;
-
     /// walk and search the dentry using the given related path(ex. a/b/c)
     /// construct the dentry tree along the way
     /// walk start from the current entry, recrusivly
@@ -224,70 +225,174 @@ impl dyn Dentry {
 
 === DCache
 
-DCACHE，即 Dentry Cache，专门用于缓存路径，避免发生多次查找重复路径。
+`DCACHE`，即 Dentry Cache，专门用于缓存路径，避免发生多次查找重复路径。
 
 ```rust
 pub static DCACHE: SpinNoIrqLock<BTreeMap<String, Arc<dyn Dentry>>> = 
     SpinNoIrqLock::new(BTreeMap::new());
 ```
 
-DCACHE 将绝对路径与对应的 Dentry 进行映射。每次当我们试图查询路径时，会先试着在 DCACHE 中寻找。这个策略可以大大加速一些经常性事件。
+`DCACHE` 将绝对路径与对应的 Dentry 进行映射。每次当我们试图查询路径时，会先试着在 `DCACHE` 中寻找。这个策略可以大大加速一些经常性事件。
 
 
 === Inode
 
-索引节点是对文件系统中文件信息的抽象。对于文件系统中的文件来说，文件名可以随时更改，但是索引节点对文件一定是唯一的，并且随文件的存在而存在。
-
-索引节点由 `Inode` trait 表示，如下：
+在 Chronix 中，Inode 独一无二地映射了一个文件系统的具体资源。以下为 Inode 的基类。
 
 ```rust
-pub trait Inode: Send + Sync + DowncastSync {
-    /// Get metadata of this Inode
-    fn meta(&self) -> &InodeMeta;
-
-    /// Get attributes of this file
-    fn get_attr(&self) -> SysResult<Stat>;
-}
-```
-
-索引节点对象由 `InodeMeta` 结构体表示，下面给出它的结构和描述：
-
-```rust
-pub struct InodeMeta {
-    /// Inode number.
+/// the base Inode of all file system
+pub struct InodeInner {
+    /// inode number
     pub ino: usize,
-    /// Mode of inode.
+    /// super block that owned it
+    pub super_block: Option<Weak<dyn SuperBlock>>,
+    /// size of the file in bytes
+    pub size: AtomicUsize,
+    /// link count
+    pub nlink: AtomicUsize,
+    /// mode of inode
     pub mode: InodeMode,
-    /// Device id for device inodes, e.g. tty device inode.
-    pub dev_id: Option<DevId>,
-    /// Super block this inode belongs to.
-    pub super_block: Weak<dyn SuperBlock>,
-    /// File page cache.
-    pub page_cache: Option<PageCache>,
-    /// Mutable date with mutex protection.
-    pub inner: Mutex<InodeMetaInner>,
-}
-
-pub struct InodeMetaInner {
-    /// Size of a file in bytes.
-    pub size: usize,
-    /// Last access time.
-    pub atime: TimeSpec,
-    /// Last modification time.
-    pub mtime: TimeSpec,
-    /// Last status change time.
-    pub ctime: TimeSpec,
-    /// State of the underlying file.
-    pub state: InodeState,
+    /// last access time
+    pub atime: SpinNoIrqLock<TimeSpec>,
+    /// last modification time
+    pub mtime: SpinNoIrqLock<TimeSpec>,
+    /// last state change time
+    pub ctime: SpinNoIrqLock<TimeSpec>,
 }
 ```
+
+#strong[`InodeInner`] 记录了一个 Inode 的基础信息：
+- `ino`：每个 `Inode` 在 Chronix 中都会有一个独一无二的序号。
+- `super_blocks`：指向了这个 `Inode` 来源于的超级块
+- `size`：对于不同类型的 `Inode`，`size` 有不同的含义，可能是文件的大小，或者是没有作用。
+- `nlink`：指向这个 `Inode` 的硬链接的数量。
+- `mode`：这个 `Inode` 的类型、访问权限等
+- `atime/mtime/ctime`：最后访问/修改/状态改变的时间
+
+
+```rust
+/// Inode trait for all file system to implement
+pub trait Inode {
+    /// return inner
+    fn inode_inner(&self) -> &InodeInner;
+    /// use name to lookup under the current inode
+    fn lookup(&self, _name: &str) -> Option<Arc<dyn Inode>>;
+    /// list all files/dir/symlink under current inode
+    fn ls(&self) -> Vec<String>;
+    /// read at given offset in direct IO
+    /// the Inode should make sure stop reading when at EOF itself
+    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32>;
+    /// write at given offset in direct IO
+    /// the Inode should make sure stop writing when at EOF itself
+    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, i32>;
+    /// get the page cache it owned
+    fn cache(&self) -> Arc<PageCache>;
+    /// get a page at given offset
+    fn read_page_at(self: Arc<Self>, _offset: usize) -> Option<Arc<Page>>;
+    /// read at given offset, allowing page caching
+    fn cache_read_at(self: Arc<Self>, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32>;
+    /// write at given offset, allowing page caching
+    fn cache_write_at(self: Arc<Self>, _offset: usize, _buf: &[u8]) -> Result<usize, i32>;
+    /// create inode under current inode
+    fn create(&self, _name: &str, _mode: InodeMode) -> Option<Arc<dyn Inode>>;
+    /// resize the current inode
+    fn truncate(&self, _size: usize) -> Result<usize, SysError>;
+    /// get attributes of a file
+    fn getattr(&self) -> Kstat;
+    /// get extra attributes of a file
+    fn getxattr(&self, _mask: XstatMask) -> Xstat;
+    /// create a symlink of this inode and return the symlink inode
+    fn symlink(&self, _target: &str) -> Result<Arc<dyn Inode>, SysError>;
+    /// create a hard link using this inode path and the target path
+    fn link(&self, _target: &str) -> Result<usize, SysError>;
+    /// read out the path from the symlink
+    fn readlink(&self) -> Result<String, SysError>;
+    /// called by the unlink system call
+    fn unlink(&self) -> Result<usize, i32>;
+    /// remove inode current inode
+    fn remove(&self, _name: &str, _mode: InodeMode) -> Result<usize, i32>;
+    /// rename inode from current path to dst path
+    /// return the new inode
+    fn rename(&self, _target: &str, _new_inode: Option<Arc<dyn Inode>>) -> Result<(), SysError>;
+}
+```
+
+注意 `Inode` 的方法会较多，原因在于我们希望可以更小粒度地控制 `Inode`，并减少 `Dentry` 等层具体实现的代码量。同时兼容更多的文件系统。对于临时文件系统以及磁盘文件系统，会使用到页缓存。如果让每个 `Dentry` 或者 `File` 持有一个页缓存，我们需要处理不一致性的问题，可能涉及分布式的概念，所以这里采取较为简单的方式：即一个 `Inode` 持有一个页缓存。
 
 
 === File
 
-(todo)
+```rust
+/// basic File object
+pub struct FileInner {
+    /// the dentry it points to
+    pub dentry: Arc<dyn Dentry>,
+    /// the current pos 
+    pub offset: AtomicUsize,
+    /// file flags
+    pub flags: SpinNoIrqLock<OpenFlags>,
+}
+```
 
-`File` 对象，即文件。每一个 File 对应于一个 file discriptor 。注意这里的 File 和文件系统的 *文件* 是完全两个概念，File 是进程打开的 *文件* 在内存中的表示。
+`File` 对象，即文件。每一个 File 对应于一个 file discriptor 。注意这里的 `File` 和文件系统的 *文件* 是完全两个概念。在 Chronix 中，File 都是由 Dentry “打开” 而来。`File` 本质是 `Inode` + `Dentry` 在进程中的表示。
+
+
+```rust
+pub trait File: Send + Sync + DowncastSync {
+    /// get basic File object
+    fn file_inner(&self) -> &FileInner;
+    /// Read file, will adjust file offset
+    async fn read(&self, buf: &mut [u8]) -> Result<usize, SysError>;
+    /// Write file, will adjust file offset
+    async fn write(&self, buf: &[u8]) -> Result<usize, SysError>;
+    /// Read file, file offset will not change
+    async fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SysError>;
+    /// Write file, file offset will not change
+    async fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, SysError>;
+    /// call by ioctl syscall
+    fn ioctl(&self, _cmd: usize, _arg: usize) -> SysResult;
+    /// base poll 
+    async fn base_poll(&self, events: PollEvents) -> PollEvents;
+    /// get the file flags
+    fn flags(&self) -> OpenFlags;
+    /// set the file flags
+    fn set_flags(&self, flags: OpenFlags);
+    /// get file current offset
+    fn pos(&self) -> usize;
+    /// set file current offset
+    fn set_pos(&self, pos: usize);
+    /// move the file position index (see lseek)
+    fn seek(&self, offset: SeekFrom) -> Result<usize, SysError>;
+}
+```
+
+一个 `File` 具有基本的读写、轮询等方法。
+
+==== Fd Table
+
+```rust
+/// the fd table
+pub struct FdTable {
+    /// the inner table
+    pub fd_table: Vec<Option<FdInfo>>,
+    /// resource limit: max fds
+    pub rlimit: RLimit,
+}
+```
+
+进程会通过 `FdTable` 来管理打开的文件。
+
+```rust
+/// fd info
+pub struct FdInfo {
+    /// the file it points to
+    pub file: Arc<dyn File>,
+    /// fd flags
+    pub flags: FdFlags,
+}
+```
+
+基本的表项为 `FdInfo`：记录了打开的文件，以及打开的 `FdFlags`。
 
 
 == 磁盘文件系统
@@ -303,26 +408,40 @@ ext4（Fourth Extended Filesystem） 是 Linux 上广泛使用的日志型文件
 - `Ext4Dentry`：本质上通过操作 Ext4Inode 来实现目录的操作。
 - `Ext4File`: Ext4 实现的 File 对象，注意和 lwext4_rust 向上提供的 Ext4File 并非同一个东西。
 
-(todo: how we change lwext4_rust)
-
-1. how to mount
-2. how to deal with page cache? data-inconsistency?
+为了支持挂载、链接等，我们对 `lwext4_rust` 做了微小的修改。
 
 == 非磁盘文件系统
 
-add overview here
+在传统计算机系统中，文件系统通常用于管理磁盘等持久化存储设备上的数据，如 Ext4、FAT32、NTFS 等。然而，现代操作系统还广泛使用#strong[非磁盘文件系统（Non-Disk File Systems）]，它们并不依赖物理存储介质，而是由内核动态生成，主要用于系统管理、进程间通信（IPC）、设备抽象和运行时信息访问。
+
+与传统的磁盘文件系统相比，非磁盘文件系统具有以下特点：
+- _不占用物理存储_：数据通常存储在内存中，或由内核动态生成。
+- _动态内容_：文件内容可能随系统状态实时变化。
+- _特殊用途_：主要用于系统管理、调试、设备控制和进程间通信，而非持久化存储。
+- _高性能_：由于不涉及磁盘 I/O，访问速度极快（如 tmpfs）。
 
 ===  procfs
 
-todo
+procfs（进程文件系统）是类Unix系统（如Linux）中一种特殊的虚拟文件系统，它不占用磁盘空间，而是由内核动态生成，以文件系统的形式向用户空间提供内核和进程信息的接口。它通常挂载在`/proc`目录下，是系统监控、调试和性能分析的重要工具。目前 Chronix 支持：
+
+- #strong[`/proc/meminfo`]：输出内存使用情况（总内存、空闲内存、缓存等）
+- #strong[`/proc/self_/exe`]：指向进程的可执行文件（符号链接）
+- #strong[`/proc/mounts`]：记录挂载点
 
 === devfs
 
-todo
+devfs（设备文件系统）是类Unix系统（如Linux）中用于管理设备文件（Device Files）的一种虚拟文件系统。它动态地在`/dev`目录下创建设备节点，使得用户空间程序可以通过标准的文件操作（如open、read、write）与硬件设备交互。
+
+- #strong[`/dev/cpu_dma_latency`]：用户态程序直接向内核请求更积极的 CPU 功耗状态管理策略，以减少 DMA 传输的延迟。
+- #strong[`/dev/null`]：黑洞设备（丢弃所有写入数据）
+- #strong[`/dev/rtc`]：实时时钟设备
+- #strong[`/dev/tty`]：串口设备
+- #strong[`/dev/zero`]：输入输出都为全 0 的设备
+- #strong[`/dev/urandom`]：随机数生成器
 
 === tmpfs
 
-在 Chronix 中，临时文件系统（tmp fs） 和共享内存文件系统（shm fs）的文件都只存在于内存中。由于数据直接存储在内存中，读写操作的速度非常快，没有磁盘 I/O 的开销。tmpfs 中的数据在系统重启后会被清除，适合存储临时文件、缓存数据等不需要持久化的内容。shmfs 提供了进程间共享内存的机制，使得多个进程可以高效地共享数据，避免了数据复制的开销。内存文件系统可以根据实际使用情况动态调整大小，既不会过度占用内存，也能在需要时自动扩展。内存文件系统作为 VFS 的一个具体实现，完全遵循 VFS 的接口规范，这使得用户程序可以像操作普通文件系统一样操作内存文件系统，保持了良好的一致性和易用性。
+在 Chronix 中，临时文件系统（tmp fs） 和共享内存文件系统（shm fs）的文件都只存在于内存中。由于数据直接存储在内存中，读写操作的速度非常快，没有磁盘 I/O 的开销。`tmpfs` 中的数据在系统重启后会被清除，适合存储临时文件、缓存数据等不需要持久化的内容。`shmfs` 提供了进程间共享内存的机制，使得多个进程可以高效地共享数据，避免了数据复制的开销。内存文件系统可以根据实际使用情况动态调整大小，既不会过度占用内存，也能在需要时自动扩展。内存文件系统作为 VFS 的一个具体实现，完全遵循 VFS 的接口规范，这使得用户程序可以像操作普通文件系统一样操作内存文件系统，保持了良好的一致性和易用性。
 
 利用 Chronix 内核中已有的页缓存机制（后文会介绍），可以完美地实现临时文件的读写。
 
@@ -333,7 +452,7 @@ pub struct TmpInode {
 }
 ```
 
-tmpfs 中的文件，真正持有的资源是一个 TmpInode。TmpInode 除了包含一些基本信息外（InodeInner），还持有一个页缓存的指针。当需要读写时，会调用以下两个函数。这两个方法的操作类似，会通过页缓存的映射，找到文件映射的物理内存，并以页为单位进行读写。
+tmpfs 中的文件，真正持有的资源是一个 `TmpInode`。`TmpInode` 除了包含一些基本信息外（`InodeInner`），还持有一个页缓存的指针。当需要读写时，会调用以下两个函数。这两个方法的操作类似，会通过页缓存的映射，找到文件映射的物理内存，并以页为单位进行读写。
 
 ```rust
 fn cache_read_at(self: Arc<Self>, offset: usize, buf: &mut [u8]) -> Result<usize, i32>;
@@ -351,11 +470,12 @@ fn cache_write_at(self: Arc<Self>, offset: usize, buf: &[u8]) -> Result<usize, i
 
 在没有页缓存机制之前，用户读写文件，本质是向文件系统提供了一部份内存，请求文件系统将磁盘上的数据填入这些内存，文件系统会通过与磁盘的直接 IO 来读出/写入数据。这样的话，当一个文件需要大量的读写，将会造成大量的 IO，是不可忽视的开销。于是我们需要引入页缓存机制。
 
-（add photos)
+#img(
+    image("../assets/image/fs/page-cache.svg"),
+    caption: "磁盘文件系统页缓存"
+)
 
-页缓存，即 Page Cache，以页为单位，缓存文件内容。当第一次读入文件的时候，系统将会将其放在 Page Cache 指向的内存中，再将这部分内存复制给用户。这样，在第二次需要读写文件的时候，系统可以直接在内存读写，而无需引发 IO，从而减小开销。同时，在用户使用内存映射的 IO（比如 mmap），可以通过将用户对应的虚拟地址空间映射到缓存的内存空间来实现。
-
-(add photos)
+#strong[页缓存]，即 Page Cache，以页为单位，缓存文件内容。当第一次读入文件的时候，系统将会将其放在 Page Cache 指向的内存中，再将这部分内存复制给用户。这样，在第二次需要读写文件的时候，系统可以直接在内存读写，而无需引发 IO，从而减小开销。同时，在用户使用内存映射的 IO（比如 mmap），可以通过将用户对应的虚拟地址空间映射到缓存的内存空间来实现。
 
 === Page
 
@@ -391,39 +511,25 @@ pub struct PageCache {
 }
 ```
 
-`PageCache`本质上提供了文件偏移量到缓存页的映射。磁盘文件系统的每个 Inode 都会持有一个 `PageCache`，通过 `PageCache` 完成 cache read/write，Inode 需要自己负责维护 `PageCache` 的状态。在 Inode 析构时，在 Drop 中会使用 `PageCache` 的 `flush` 方法，将所有脏页写回磁盘。
+`PageCache`本质上提供了文件偏移量到缓存页的映射。磁盘文件系统的每个 Inode 都会持有一个 `PageCache`，通过 `PageCache` 完成 cache read/write，Inode 需要自己负责维护 `PageCache` 的状态。在 Inode 析构时，会将所有脏页写回磁盘。
+
+注意磁盘文件系统与非磁盘文件系统的页缓存的区别：前者需要维护数据的一致性。Chronix 采取以下的策略：
+
+- #strong[读的策略]：
+    - 读命中：目标页存在于页缓存中，直接读（需要非常小心地维护好 `end` `size` 等字段，否则可能导致读出超过文件范围的内容）
+    - 读缺失：若页索引在文件大小内，从磁盘中读出该页。
+- #strong[写的策略]：
+    - 写命中：目标页存在于页缓存中，直接写（可能需要更新 `end` `size`等）
+    - 写缺失：若页索引小于磁盘上该文件大小，需要先从磁盘中读出该页，再在其上修改；若页索引超过磁盘上文件大小，则可以直接创建新的页，并在页缓存层面写。
 
 
 == 其他数据结构
-
-=== FdTable
-
-Unix 设计哲学将文件本身抽象成 Inode，其保存了文件的元数据；将内核打开的文件抽象成 File，其保存了当前读写文件的偏移量以及文件打开的标志；进程只能看见文件描述符，文件描述符由进程结构体中的文件描述符表进行处理。
-
-当一个进程调用 `open()` 系统调用，内核会创建一个文件对象来维护被进程打开的文件的信息，但是内核并不会将这个文件对象返回给进程，而是将一个非负整数返回，即 `open()` 系统调用的返回值是一个非负整数，这个整数称作文件描述符。文件描述符和文件对象一一对应，而维护二者对应关系的数据结构，就是文件描述符表。在实现细节中，文件描述符表本质是一个数组，数组中每一个元素就是文件对象，而元素下标就是文件对象对应的文件描述符。
-
-Phoenix 将 FdTable 定义成一个 `Vec<Option<FdInfo>>`，支持动态增长长度，在 fork 复制 `FdTable` 时比固定大小的数组时间开销更小，并且可以满足 Linux 系统中 RLimit 的限制。
-
-```rust
-#[derive(Clone)]
-pub struct FdTable {
-    table: Vec<Option<FdInfo>>,
-    rlimit: RLimit,
-}
-
-#[derive(Clone)]
-pub struct FdInfo {
-    /// File.
-    file: Arc<dyn File>,
-    /// File descriptor flags.
-    flags: FdFlags,
-}
-```
 
 === Pipe
 
 管道（Pipe）是一种进程间通信的机制。其可以支持一个进程将数据流输出到另一个进程，或者从另一个进程读取数据流。管道本身可以看成一个 FIFO 的队列，写者（writer）在队尾添加数据，读者（reader）在队头取出数据。用户使用管道时，会向内核发出相关的系统调用，内核会返回两个 file discriber，一个指向写者文件，一个指向读者文件。写者文件只可以写不可读，读者文件反之。当两个进程拥有相同的 fd table 时，就可以“同时”使用这两个 fd。可能一个进程会向写者文件写入数据流，另一个进程可能会从读者文件读出数据流，从而实现进程间数据流的传递。如下图：
 
-add pictures
-
-todo
+#img(
+    image("../assets/image/fs/pipe.svg"),
+    caption: "管道原理"
+)
