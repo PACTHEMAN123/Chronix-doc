@@ -4,77 +4,90 @@
 == 时钟中断
 <时钟中断>
 
-RISC-V架构中，内置时钟和计数器用于实现操作系统的计时机制，其中64位的`mtime`计数器记录处理器自上电以来的时钟周期，而`mtimecmp`用于触发时钟中断。由于内核处于S特权级，无法直接访问这些M特权级的CSR，因此通过SEE（OpenSBI）提供的SBI接口间接实现计时器控制。
+在操作系统中实现精确计时依赖于硬件提供的时钟和计数器机制。`RISC-V` 架构提供了核心的 `mtime` (64 位计数器，记录自启动以来的时钟周期数) 和 `mtimecmp` (比较寄存器，用于触发时钟中断)。由于这些寄存器属于 M 特权级，运行在 S 特权级的内核无法直接访问。因此，`Chronix` 内核通过调用运行在 M 级的 SEE（如 OpenSBI）提供的 SBI 接口来间接设置 mtimecmp 和接收定时器中断。
 
-Phoenix中利用`riscv::register::time::read()`函数读取 RISC-V 架构下的
-`mtime`
-计数器的值，得到系统自启动以来经过的时钟周期数作为系统时间，转换为Rust核心库`core`中的`Duration`结构体，它能够清晰地表示时间间隔，避免了直接操作裸露的计数值所带来的错误和混淆，确保时间的计算和表示是统一的，并且可以利用
-`Duration` 提供的丰富的时间操作方法（如加减法、比较等）
+`Chronix`在 RISC-V 上利用 `riscv::register::time::read()` 函数读取 mtime 计数器的值，获取系统启动后的时钟周期数作为基础时间度量。为了提升代码的清晰度、安全性和可维护性， `Chronix` 将获取到的原始计数值转换为 Rust 核心库 (core) 中的 Duration 结构体。Duration 提供了对时间间隔的统一、类型安全的抽象，避免了直接操作裸计数值容易导致的错误和概念混淆。更重要的是，它提供了丰富的时间操作方法（如加减、比较、单位转换等），极大地简化了内核中与时间相关的计算逻辑。
 
-== 定时器
-<定时器>
+`LoongArch`架构采用不同的机制实现计时。其核心是一个高精度、恒定频率的计数器（通常称为 RDCNT 或类似名称），可通过专用指令（如 rdcnt.d/rdcntvl.d）直接读取当前计数值。计时器中断的控制则通过一组特定的控制状态寄存器 (CSR) 实现，主要包括：
+
+1. #strong[`RDCNT`] 值读取： 内核使用 rdcnt.d (读取 64 位值) 或 `rdcntvl.d` (读取低 32 位值) 等指令直接读取计数器的当前值。该值同样代表自启动（或计数器复位）以来经过的时钟周期数。
+
+2. #strong[计时器中断配置]： LoongArch 使用 `TICLR` (定时器中断清除寄存器)、`TINTVAL` (定时器初始值寄存器) 和 `TCFG` (定时器配置寄存器) 等 CSR 来设置和触发定时器中断。
+
+    + TINTVAL 寄存器写入一个初始计数值（相对于某个基准点）。
+
+    + 计数器持续累加。
+
+    + 当计数器值达到或超过 TINTVAL 中设定的值时，会触发定时器中断。
+
+    + 内核在中断处理程序中通常需要清除中断标志（通过 TICLR）并重新设置 TINTVAL 以安排下一次中断。
+
+3. #strong[特权级访问]： 与 RISC-V 的 M/S 级隔离不同，LoongArch 内核（运行在 PLV0 特权级）通常可以直接访问这些计时相关的 CSR 进行配置和读取，无需类似 SBI 的固件中介层（除非特定硬件实现或安全启动有特殊要求）。这简化了内核计时器驱动的实现。
+
+== 定时器机制
+<定时器机制>
 
 在操作系统中，定时器通常用来管理一段时间后需要触发的事件。这些定时器需要记录触发时间和要执行的回调函数。
 
-Phoenix的定时器结构体`Timer`参考了Linux系统的回调函数设计，但是结合了rust的特性。Phoenix定义了`TimerEvent`
-trait，定义了一个通用的接口，用于描述定时器触发时需要执行的操作。与往届作品Titanix仅在`Timer`中定义了`Waker`用于唤醒相比，这种设计提高了定时器的灵活性。
+事件抽象层 (TimerEvent trait)
+
 
 ```rust
-/// A trait that defines the event to be triggered when a timer expires.
-/// The TimerEvent trait requires a callback method to be implemented,
-/// which will be called when the timer expires.
+/// 定义定时器到期时执行操作的通用接口
 pub trait TimerEvent: Send + Sync {
-    /// The callback method to be called when the timer expires.
-    /// This method consumes the event data and optionally returns a new
-    /// timer.
-    ///
-    /// # Returns
-    /// An optional Timer object that can be used to schedule another timer.
+    /// 定时器到期时的回调执行方法
+    /// 
+    /// 通过`Box<Self>`实现所有权转移，确保：
+    /// 1. 动态分发能力：支持多态事件处理
+    /// 2. 内存安全性：自动回收事件资源
+    /// 
+    /// 返回值设计支持定时器链式触发，特别适用于
+    /// 周期性定时场景（如`sys_setitimer`）
     fn callback(self: Box<Self>) -> Option<Timer>;
 }
 ```
 
-`callback`方法的参数`self: Box<Self>`通过将 `self` 移动到 `Box`
-内，保证了 trait 对象的动态分发能力（即运行时多态），并且确保调用
-`callback`
-时定时器的数据所有权被安全转移。返回值为`Option<Timer>`，表示在当前定时器触发后，可以选择性地创建一个新的定时器，这种设计使得定时器能够链式触发，以便支持需要重复触发定时器的`sys_setitimer`系统调用。通过
-`Send` 和 `Sync` trait
-bounds，确保定时器事件在多线程环境中是安全的。可以在线程间传递和共享
+`callback`方法的参数`self: Box<Self>`通过将 `self` 移动到 `Box`内，保证了 trait 对象的动态分发能力（即运行时多态），并且确保调用`callback`
+时定时器的数据所有权被安全转移。返回值为`Option<Timer>`，表示在当前定时器触发后，可以选择性地创建一个新的定时器，这种设计使得定时器能够链式触发，以便支持需要重复触发定时器的`sys_setitimer`系统调用。通过`Send` 和 `Sync` trait bounds，确保定时器事件在多线程环境中是安全的。可以在线程间传递和共享
 `Timer` 实例，而无需担心数据竞争问题。
 
-`Timer`
-结构体用来表示一个具体的定时器实例，包含到期时间和需要执行的回调函数。具体设计如下：
+`Timer`结构体用来表示一个具体的定时器实例，包含到期时间和需要执行的回调函数。具体设计如下：
 
 ```rust
-/// Represents a timer with an expiration time and associated event data.
-/// The Timer structure contains the expiration time and the data required
-/// to handle the event when the timer expires.
+/// 表示具有特定触发时间和关联事件的定时器实体
 pub struct Timer {
-    /// The expiration time of the timer.
-    /// This indicates when the timer is set to trigger.
+    /// 绝对过期时间（基于单调时钟）
     pub expire: Duration,
-
-    /// A boxed dynamic trait object that implements the TimerEvent trait.
-    /// This allows different types of events to be associated with the
-    /// timer.
+    
+    /// 动态事件处理器（实现TimerEvent trait）
     pub data: Box<dyn TimerEvent>,
 }
 ```
 
+核心特质：
+
++ 时间精度：采用Duration类型确保纳秒级时间精度
+
++ 事件解耦：泛化事件处理器与定时机制，增强扩展性
+
++ 零成本抽象：编译期静态分发与运行时动态分发结合优化性能
+
 == 定时器队列
 <定时器队列>
 
-Phoenix使用`TimerManager`
-结构体实现了一个高效、安全且易于管理的定时器管理机制。使用`BinaryHeap`二叉堆数据结构按到期时间排序管理所有的定时器，其插入和删除操作复杂度为
-O(log n)，能在 O(1)
-时间内获取最早到期的定时器，确保定时器触发的实时性。Phoenix支持用户态时间中断和内核态时间中断，两种中断触发时都会检查是否有定时器到期。
+Chronix使用`TimerManager`结构体实现了一个高效、安全且易于管理的定时器管理机制。使用`BinaryHeap`二叉堆数据结构按到期时间排序管理所有的定时器,提供高效可靠的定时任务调度，其架构设计如下：
 
 ```rust
-/// `TimerManager` is responsible for managing all the timers in the system.
+/// 全局定时器管理系统
 pub struct TimerManager {
-    /// A priority queue to store the timers.
+    /// 基于最小堆的优先级队列，按过期时间排序
     timers: SpinNoIrqLock<BinaryHeap<Reverse<Timer>>>,
 }
 ```
+当前实现特点：
 
-目前Phoenix已实现较为高效的定时任务管理，但是仍有可以改进的地方，例如当前使用的`BinaryHeap`数据结构虽然在插入和删除操作上的复杂度较低，但由于其需要频繁分配和释放内存，可能会导致性能上的开销。而侵入式链表（如Linux中的`list_head`）可以减少内存分配和释放的频率，Linux采用侵入式链表与红黑树实现了更高效的定时任务管理。
++ 高效：采用二叉堆实现，插入删除操作时间复杂度为O(log n)，定时器调度时间复杂度为O(1)
+
++ 安全：采用SpinNoIrqLock`<BinaryHeap<Reverse<Timer>>> `确保定时器调度过程不被中断，保证定时器调度的可靠性
+
++ 触发机制： 同时处理用户态和内核态时间中断，中断触发时自动扫描到期定时器
