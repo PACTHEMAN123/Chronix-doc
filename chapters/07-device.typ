@@ -1,117 +1,129 @@
 = 设备驱动
 <设备驱动>
 
-外设管理模块在操作系统中具有至关重要的作用。其主要目的是管理和协调系统中的各种外设（外部设备），确保它们能够高效、稳定地运行。外设管理模块包括设备的发现、初始化、驱动程序加载以及中断处理等功能。这些功能的实现直接影响到整个系统的性能和稳定性。
+外设管理模块主要负责外设的识别、配置、驱动和中断分发等功能，对操作系统至关重要。
 
-Phoenix目前支持块设备(Block Device)、网络设备(Network
-Device)，串口(Char Device)和平台级中断控制器(PLIC)，参考了去年二等奖参赛作品MankorOs的`DeviceManger`设计。
+Chronix目前支持MMIO和PCI-E总线的块设备(Block Device)、网络设备(Network
+Device)，串口(Char Device)和平台级中断控制器(PLIC/Platic)，参考了去年二等奖参赛作品MankorOs的`DeviceManger`设计。
 
 ```rust
-/// The DeviceManager struct is responsible for managing the devices within
-/// the system. It handles the initialization, probing, and interrupt
-/// management for various devices.
-pub struct DeviceManager {
-    /// PLIC (Platform-Level Interrupt Controller) to manage external
-    /// interrupts.
-    pub plic: Option<PLIC>,
-    /// Vector containing CPU instances.
-    pub cpus: Vec<CPU>,
-    /// A BTreeMap that maps device IDs (DevId) to device instances.
+/// Chronix's device manager
+/// responsible for:
+/// Creates device instance from device tree,
+/// Maintains device instances lifetimes
+/// Mapping interrupt No to device
+pub struct DeviceManager {    
+    /// Optional interrupt controller
+    pub irq_ctrl: Option<IrqCtrl>,
+    /// Optional PCI
+    pub pci: Option<PciManager>,
+    /// Optional MMIO
+    pub mmio: Option<MmioManager>,
+    /// mapping from device id to device instance
     pub devices: BTreeMap<DevId, Arc<dyn Device>>,
-    /// A BTreeMap that maps interrupt numbers to device instances
-    pub irq_map: BTreeMap<usize, Arc<dyn Device>>,
+    /// mapping from irq no to device instance
+    pub irq_map: BTreeMap<IrqNo, Arc<dyn Device>>
 }
 ```
 
-使用 `Option<PLIC>` 是为了在设备树中检测到 `PLIC`
-后再进行初始化。如果设备树中没有 `PLIC` 的相关信息，这个字段可以保持为
-`None`，避免不必要的初始化。`devices`字段维护一个设备 ID (`DevId`)
+`irq_ctrl`字段维护了一个中断控制器，它由HAL提供，在RISC-V上是PLIC，在龙芯上就是Platic。
+
+以下是两个平台的中断控制器，通过设备树进行初始化代码：
+```rust
+/// Loongarch: find and init Platic
+fn from_dt(root: &Fdt, mmio: impl MmioMapperHal) -> Option<Self> {
+    let platic = root.find_compatible(&["loongson,pch-pic-1.0"])?;
+    let cpu_cnt = root.find_all_nodes("/cpus/cpu").count();
+    log::info!("[IrqCtrl::from_dt] cpu count: {cpu_cnt}");
+    Eiointc::init(cpu_cnt);
+    let platic_region = platic.reg()?.next()?;
+    let start = platic_region.starting_address as usize;
+    let size = platic_region.size?;
+    let vregion = mmio.map_mmio_area(start..start+size);
+    let platic = Platic::new(vregion.start);
+    platic.write_w(Platic::INT_POLARITY, 0x0);
+    platic.write_w(Platic::INT_POLARITY + 4, 0x0);
+    platic.write_w(Platic::INTEDGE, 0x0);
+    platic.write_w(Platic::INTEDGE + 4, 0x0);
+    Some(Self { platic })
+}
+
+/// Riscv: find and init PLIC
+fn from_dt(device_tree: &fdt::Fdt, mmio: impl MmioMapperHal) -> Option<Self> {
+    let plic_node = device_tree.find_compatible(&["riscv,plic0", "sifive,plic-1.0.0"])?;
+    let plic_reg = plic_node.reg().unwrap().next().unwrap();
+    let mmio_base = plic_reg.starting_address as usize;
+    let mmio_size = plic_reg.size.unwrap();
+    log::info!("plic base_address:{mmio_base:#x}, size:{mmio_size:#x}");
+    let mmio_vbase = mmio.map_mmio_area(mmio_base..mmio_base+mmio_size).start;
+    Some(Self { plic: PLIC::new(mmio_base, mmio_size, mmio_vbase) })
+}
+```
+
+
+`pci`字段和`mmio`字段分别维护了PCI-E总线和MMIO总线的总线管理器，它实现了各自总线的设备遍历和配置的逻辑。
+以下是遍历两条总线的代码：
+```rust
+for mut device in pci.enumerate_devices() {
+    let dev_class: PciDeviceClass = device.func_info.class.into();
+    let dev = match dev_class {
+        PciDeviceClass::MassStorageContorller => {
+            pci.init_device(&mut device).unwrap();
+            Arc::new(VirtIOPCIBlock::new(device))
+        }
+        _ => continue
+    };
+    // todo: map irq number and add device
+}
+
+for deivce in mmio.enumerate_devices() {
+    if let Ok(mmio_transport) = deivce.transport() {
+        let dev = match mmio_transport.device_type() {
+            virtio_drivers::transport::DeviceType::Block => {
+                Arc::new(VirtIOMMIOBlock::new(deivce.clone(), mmio_transport))
+            }
+            _ => continue
+        };
+        // todo: map irq number and add device
+    }
+}
+```
+
+`devices`字段维护一个设备 ID (`DevId`)
 到设备对象 (`Arc<dyn Device>`)
 的映射，提供一个高效的设备管理结构，支持设备的动态添加和查找。
 
 == 设备树
 <设备树-1>
 
-操作系统内核获取到设备树的地址的流程如下：
+HAL封装了获取设备树地址的功能。例如RISC-V平台上，由SBI在启动阶段时在a2传入设备树地址，在龙芯平台上，则是由固件提供。除了这些方法，
+还可以将编译好的设备树文件打包到内核的二进制镜像中。HAL隐藏了这些细节，操作系统内核直接通过HAL提供的函数获取到设备树的地址。
 
-+ OpenSBI启动：当系统启动时，OpenSBI
-  固件首先运行。它完成基础的硬件初始化，如内存控制器设置、I/O 初始化等。
-
-+ 传递控制权到内核：OpenSBI
-  初始化完成后，将控制权传递给内核的入口点，并传递必要的参数。这些参数包括：
-
-  - `hart_id`：当前硬件线程的 ID。
-  - `dtb_addr`：设备树地址，该地址指向设备树描述符（DTB），描述了系统的硬件布局和配置信息。
-
-  在Phoenix中，内核的入口点是`_start`函数，其定义如下：
-
-  ```rust
-#[naked]
-#[no_mangle]
-#[link_section = ".text.entry"]
-unsafe extern "C" fn _start(hart_id: usize, dtb_addr: usize) -> ! {
-    core::arch::asm!(
-        // 1. set boot stack
-        ...
-        // 2. enable sv39 page table
-        ...
-        // 3. jump to rust_main
-        "
-           ...
-           la      a2, rust_main
-           or      a2, a2, t2
-           jalr    a2                      // call rust_main
-        "
-        ...
-    )
-}
-  ```
-
-  这里的 `jalr a2` 指令将跳转到 `rust_main` 并传递参数。由于 `hart_id`
-  和 `dtb_addr` 保持在寄存器 `a0` 和 `a1` 中，这些参数在跳转到
-  `rust_main` 时依然有效。
-
-+ 传入`rust_main`内核主函数：
-
-  ```rust
-  #[no_mangle]
-  fn rust_main(hart_id: usize, dtb_addr: usize) {
-      if FIRST_HART
-          .compare_exchange(true, false, 
-              Ordering::SeqCst, Ordering::SeqCst)
-          .is_ok()
-      {
-          ...
-          hart::init(hart_id);
-          config::mm::set_dtb_addr(dtb_addr);
-          ...
-      } else {
-          ...
-      }
-      ...
-  }
-  ```
-
-  内核中就的其他代码可以得到`dtb_addr`的值了
-
-`DeviceManager`实现了`probe`方法，利用`fdt` crate解析设备树
-
+以下是通过设备树初始化外设的代码示例：
 ```rust
-pub fn probe(&mut self) {
+pub fn init() {
+    let device_tree_addr = hal::get_device_tree_addr();
+    log::info!("get device tree addr: {:#x}", device_tree_addr);
+    
     let device_tree = unsafe {
-        fdt::Fdt::from_ptr(K_SEG_DTB_BEG as _).expect("Parse DTB failed")
+        fdt::Fdt::from_ptr(device_tree_addr as _).expect("parse DTB failed!")
     };
-    self.probe_plic(&device_tree);
-    self.probe_char_device(&device_tree);
-    self.probe_cpu(&device_tree);
-    self.probe_virtio_device(&device_tree);
-    // Add to interrupt map if have interrupts
-    for dev in self.devices.values() {
-        if let Some(irq) = dev.irq_no() {
-            self.irq_map.insert(irq, dev.clone());
-        }
+
+    if let Some(bootargs) = device_tree.chosen().bootargs() {
+        println!("Bootargs: {:?}", bootargs);
     }
+
+    // find all devices
+    DEVICE_MANAGER.lock().map_devices(&device_tree);
+
+    // map the mmap area
+    DEVICE_MANAGER.lock().map_mmio_area();
+
+    // init devices
+    DEVICE_MANAGER.lock().init_devices();
+
+    // enable irq
+    DEVICE_MANAGER.lock().enable_irq();
+    log::info!("External interrupts enabled");
 }
 ```
-
-通过设备树解析，Phoenix 可以实现同一份内核二进制在不同的硬件上启动。

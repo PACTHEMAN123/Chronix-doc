@@ -6,4 +6,5 @@
 #include "chapters/05-time.typ"
 #include "chapters/06-net.typ"
 #include "chapters/07-device.typ"
+#include "chapters/08-hal.typ"
 #include "chapters/99-prospect.typ"
