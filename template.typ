@@ -77,7 +77,7 @@
 
   set text(font: songti, size: 12pt)
   // 临时取消目录的首行缩进
-  set par(leading: 1.24em, first-line-indent: 0pt)
+  set par(leading: 1.2em, first-line-indent: 0pt)
   locate(loc => {
     let elements = query(heading.where(outlined: true), loc)
     for el in elements {
@@ -312,7 +312,7 @@
     }
 
     #grid(
-      columns: (70pt, 180pt),
+      columns: (70pt, 200pt),
       rows: (40pt, 40pt),
       gutter: 3pt,
       info_key("参赛队名"),
@@ -364,8 +364,8 @@
   )
 
   set text(font: songti, 12pt)
-  set par(justify: true, leading: 1.24em, first-line-indent: 2em)
-  show par: set block(spacing: 1.24em)
+  set par(justify: true, leading: 1.00em, first-line-indent: 2em)
+  show par: set block(spacing: 1.10em)
 
   set heading(numbering: (..nums) => {
     nums.pos().map(str).join(".") + " "

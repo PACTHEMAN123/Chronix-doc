@@ -165,7 +165,7 @@ Chronix中为贴合可能出现的任务状态设计了多类`TaskStatus`枚举�
 
 - _高效切换性能_：任务挂起/恢复时无需切换堆栈或操作系统的线程上下文，仅需保存少量局部变量和程序计数器。切换开销通常比有栈线程低一个数量级，甚至接近普通函数调用。这符合Chronix对性能开销的要求。
 
-- _编译器优化支持_： 无栈协程通常由编译器直接生成状态机，在rust中内置的异步编程模型通过`async` 和`await` 关键字支持无栈协程,这种语法糖使得编写和使用无栈协程变得更加简洁和直观。每个`async` 函数在编译时会被转换为状态 机,自动管理状态的保存和恢复。无栈协程符合Rust所追求的“零成本抽象”,状态机的转  换和上下文切换在编译期确定,运行时开销极小。
+- _编译器优化支持_： 无栈协程通常由编译器直接生成状态机，在rust中内置的异步编程模型通过`async` 和`await` 关键字支持无栈协程,这种语法糖使得编写和使用无栈协程变得更加简洁和直观。每个`async` 函数在编译时会被转换为状态 机,自动管理状态的保存和恢复。无栈协程符合Rust所追求的“零成本抽象”,状态机的转换和上下文切换在编译期确定,运行时开销极小。
 
 === Chronix基于协程的任务调度
 
@@ -195,7 +195,7 @@ impl <F:Future+Send+'static> Future for UserTaskFuture<F> {
 }
 ```
 
-+ #strong[`Executor`] : Rust异步模型中并不内置Executor与Reactor，而是需要编程人员自己完善其逻辑，Chronix中Executor作用包括：
+- #strong[`Executor`] : Rust异步模型中并不内置Executor与Reactor，而是需要编程人员自己完善其逻辑，Chronix中Executor作用包括：
 - 运行Futures:调用Futures的poll方法，推进任务运行
 - 任务队列：单核环境下由Executor维护一个任务队列，存放准备执行的任务
 - 循环调度： 轮询任务队列，逐个执行任务。
@@ -222,7 +222,7 @@ impl <F:Future+Send+'static> Future for UserTaskFuture<F> {
    }
    ```
 #img(
-    image("../assets/image/task/Scheduling-process.svg"),
+    image("../assets/image/task/schedule.svg", width: 50%),
     caption: "Chronix基于协程的任务调度模型",
 )
 
@@ -399,8 +399,8 @@ PELT的实现主要通过以下步骤完成：
 - `period_contribute`：当前时间窗口内的负载贡献。
 
 2. 负载更新时机：
-   - 任务唤醒：当任务被唤醒时，更新其负载。
-   - 时钟中断：当时钟中断发生时，更新所有任务的负载。
+- 任务唤醒：当任务被唤醒时，更新其负载。
+- 时钟中断：当时钟中断发生时，更新所有任务的负载。
 
 3. 分层次聚合：
 - _任务级_：每个任务的 `load_avg` 。

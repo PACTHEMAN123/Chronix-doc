@@ -4,7 +4,7 @@
 外设管理模块主要负责外设的识别、配置、驱动和中断分发等功能，对操作系统至关重要。
 
 Chronix目前支持MMIO和PCI-E总线的块设备(Block Device)、网络设备(Network
-Device)，串口(Char Device)和平台级中断控制器(PLIC/Platic)，参考了去年二等奖参赛作品MankorOs的`DeviceManger`设计。
+Device)，串口(Char Device)和平台级中断控制器(PLIC/Platic)，参考了去年二等奖参赛作品MankorOS的`DeviceManger`设计。
 
 ```rust
 /// Chronix's device manager

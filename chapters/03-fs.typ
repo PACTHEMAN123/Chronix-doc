@@ -164,49 +164,7 @@ pub struct DentryInner {
 - `children`：记录当前的 `Dentry` 的子节点，这个设计，是为了支持在一个文件系统下挂载不同的文件系统，以及不同类型的 `Dentry` 自由组合。
 - `state`：我们仿照 linux 的设计：Dentry 会有3种状态：`USED` `UNUSED` `NEGATIVE` 。在 Dentry 初始化时，状态为 `UNUSED`。在 Dentry 指向一个有效的 `Inode` 时，其状态为 `USED`。在 Dentry 的路径指向了一个无效的 `Inode` 时（Inode已经不存在了，或者不在该路径了），其状态为 `NEGATIVE`。`NEGATIVE` 状态的设计，使得我们在查询路径时，当遇到非法路径时可以尽早返回，避免重复查询文件系统。
 
-使用 `rust` 的 `dyn` 对象的机制，`Dentry` 可以做到自由组合：即一个文件系统下的 `Dentry` 的 `parent` 或者 `children` 可以来自其他的文件系统。得益于这个机制，我们可以在 VFS 层就完成路径的解析、寻找。只需要对应的文件系统实现以下的方法：
-
-```rust
-/// dentry method that all fs need to implement
-pub trait Dentry: Send + Sync {
-    /// get the inner dentry
-    fn dentry_inner(&self) -> &DentryInner;
-    /// open the inode it points as File
-    fn open(self: Arc<Self>, _flags: OpenFlags) -> Option<Arc<dyn File>>;
-    /// get the inode it points to
-    fn inode(&self) -> Option<Arc<dyn Inode>>;
-    /// set the inode it points to
-    fn set_inode(&self, inode: Arc<dyn Inode>);
-    /// clear the inode, now it doesnt have a inode
-    fn clear_inode(&self);
-    /// tidier way to get parent
-    fn parent(&self) -> Option<Arc<dyn Dentry>>;
-    /// get all children
-    fn children(&self) -> BTreeMap<String, Arc<dyn Dentry>>;
-    /// get a child
-    fn get_child(&self, name: &str) -> Option<Arc<dyn Dentry>>;
-    /// add a child
-    fn add_child(&self, child: Arc<dyn Dentry>);
-    /// remove a child
-    fn remove_child(&self, name: &str);
-    /// tider way to get name
-    fn name(&self) -> &str;
-    /// get the state
-    fn state(&self) -> DentryState;
-    /// set the state
-    fn set_state(&self, state: DentryState);
-    /// determine if negative dentry
-    fn is_negative(&self) -> bool;
-    /// get the absolute path of the dentry
-    fn path(&self) -> String;
-    /// load all child dentry 
-    fn load_child_dentry(self: Arc<Self>) -> Result<Vec<Arc<dyn Dentry>>, SysError>;
-    /// create a negative child which share the same type with self
-    fn new_neg_dentry(self: Arc<Self>, _name: &str) -> Arc<dyn Dentry>;
-}
-```
-
-接下来我们就可以在 VFS 层实现以下路径查找的方法：
+使用 `rust` 的 `dyn` 对象的机制，`Dentry` 可以做到自由组合：即一个文件系统下的 `Dentry` 的 `parent` 或者 `children` 可以来自其他的文件系统。得益于这个机制，我们可以在 VFS 层就完成路径的解析、寻找。只需要对应的文件系统实现 Dentry 的方法（trait），我们就可以在 VFS 层实现以下路径查找的方法：
 
 ```rust
 impl dyn Dentry {
@@ -222,6 +180,8 @@ impl dyn Dentry {
     pub fn follow(self: Arc<Self>) -> Result<Arc<dyn Dentry>, SysError>;
 }
 ```
+
+相当于在 VFS 层为所有文件系统实现了路径查找的功能，从而大量减少代码量。
 
 === DCache
 
@@ -269,56 +229,7 @@ pub struct InodeInner {
 - `mode`：这个 `Inode` 的类型、访问权限等
 - `atime/mtime/ctime`：最后访问/修改/状态改变的时间
 
-
-```rust
-/// Inode trait for all file system to implement
-pub trait Inode {
-    /// return inner
-    fn inode_inner(&self) -> &InodeInner;
-    /// use name to lookup under the current inode
-    fn lookup(&self, _name: &str) -> Option<Arc<dyn Inode>>;
-    /// list all files/dir/symlink under current inode
-    fn ls(&self) -> Vec<String>;
-    /// read at given offset in direct IO
-    /// the Inode should make sure stop reading when at EOF itself
-    fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32>;
-    /// write at given offset in direct IO
-    /// the Inode should make sure stop writing when at EOF itself
-    fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, i32>;
-    /// get the page cache it owned
-    fn cache(&self) -> Arc<PageCache>;
-    /// get a page at given offset
-    fn read_page_at(self: Arc<Self>, _offset: usize) -> Option<Arc<Page>>;
-    /// read at given offset, allowing page caching
-    fn cache_read_at(self: Arc<Self>, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32>;
-    /// write at given offset, allowing page caching
-    fn cache_write_at(self: Arc<Self>, _offset: usize, _buf: &[u8]) -> Result<usize, i32>;
-    /// create inode under current inode
-    fn create(&self, _name: &str, _mode: InodeMode) -> Option<Arc<dyn Inode>>;
-    /// resize the current inode
-    fn truncate(&self, _size: usize) -> Result<usize, SysError>;
-    /// get attributes of a file
-    fn getattr(&self) -> Kstat;
-    /// get extra attributes of a file
-    fn getxattr(&self, _mask: XstatMask) -> Xstat;
-    /// create a symlink of this inode and return the symlink inode
-    fn symlink(&self, _target: &str) -> Result<Arc<dyn Inode>, SysError>;
-    /// create a hard link using this inode path and the target path
-    fn link(&self, _target: &str) -> Result<usize, SysError>;
-    /// read out the path from the symlink
-    fn readlink(&self) -> Result<String, SysError>;
-    /// called by the unlink system call
-    fn unlink(&self) -> Result<usize, i32>;
-    /// remove inode current inode
-    fn remove(&self, _name: &str, _mode: InodeMode) -> Result<usize, i32>;
-    /// rename inode from current path to dst path
-    /// return the new inode
-    fn rename(&self, _target: &str, _new_inode: Option<Arc<dyn Inode>>) -> Result<(), SysError>;
-}
-```
-
-注意 `Inode` 的方法会较多，原因在于我们希望可以更小粒度地控制 `Inode`，并减少 `Dentry` 等层具体实现的代码量。同时兼容更多的文件系统。对于临时文件系统以及磁盘文件系统，会使用到页缓存。如果让每个 `Dentry` 或者 `File` 持有一个页缓存，我们需要处理不一致性的问题，可能涉及分布式的概念，所以这里采取较为简单的方式：即一个 `Inode` 持有一个页缓存。
-
+注意 `Inode` 的方法（trait）会较多，原因在于我们希望可以更小粒度地控制 `Inode`，并减少 `Dentry` 等层具体实现的代码量。同时兼容更多的文件系统。对于临时文件系统以及磁盘文件系统，会使用到页缓存。如果让每个 `Dentry` 或者 `File` 持有一个页缓存，我们需要处理不一致性的问题，可能涉及分布式的概念，所以这里采取较为简单的方式：即一个 `Inode` 持有一个页缓存。
 
 === File
 
@@ -335,38 +246,6 @@ pub struct FileInner {
 ```
 
 `File` 对象，即文件。每一个 File 对应于一个 file discriptor 。注意这里的 `File` 和文件系统的 *文件* 是完全两个概念。在 Chronix 中，File 都是由 Dentry “打开” 而来。`File` 本质是 `Inode` + `Dentry` 在进程中的表示。
-
-
-```rust
-pub trait File: Send + Sync + DowncastSync {
-    /// get basic File object
-    fn file_inner(&self) -> &FileInner;
-    /// Read file, will adjust file offset
-    async fn read(&self, buf: &mut [u8]) -> Result<usize, SysError>;
-    /// Write file, will adjust file offset
-    async fn write(&self, buf: &[u8]) -> Result<usize, SysError>;
-    /// Read file, file offset will not change
-    async fn read_at(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, SysError>;
-    /// Write file, file offset will not change
-    async fn write_at(&self, _offset: usize, _buf: &[u8]) -> Result<usize, SysError>;
-    /// call by ioctl syscall
-    fn ioctl(&self, _cmd: usize, _arg: usize) -> SysResult;
-    /// base poll 
-    async fn base_poll(&self, events: PollEvents) -> PollEvents;
-    /// get the file flags
-    fn flags(&self) -> OpenFlags;
-    /// set the file flags
-    fn set_flags(&self, flags: OpenFlags);
-    /// get file current offset
-    fn pos(&self) -> usize;
-    /// set file current offset
-    fn set_pos(&self, pos: usize);
-    /// move the file position index (see lseek)
-    fn seek(&self, offset: SeekFrom) -> Result<usize, SysError>;
-}
-```
-
-一个 `File` 具有基本的读写、轮询等方法。
 
 ==== Fd Table
 
@@ -471,7 +350,7 @@ fn cache_write_at(self: Arc<Self>, offset: usize, buf: &[u8]) -> Result<usize, i
 在没有页缓存机制之前，用户读写文件，本质是向文件系统提供了一部份内存，请求文件系统将磁盘上的数据填入这些内存，文件系统会通过与磁盘的直接 IO 来读出/写入数据。这样的话，当一个文件需要大量的读写，将会造成大量的 IO，是不可忽视的开销。于是我们需要引入页缓存机制。
 
 #img(
-    image("../assets/image/fs/page-cache.svg"),
+    image("../assets/image/fs/page-cache.svg", width: 70%),
     caption: "磁盘文件系统页缓存"
 )
 
@@ -530,6 +409,6 @@ pub struct PageCache {
 管道（Pipe）是一种进程间通信的机制。其可以支持一个进程将数据流输出到另一个进程，或者从另一个进程读取数据流。管道本身可以看成一个 FIFO 的队列，写者（writer）在队尾添加数据，读者（reader）在队头取出数据。用户使用管道时，会向内核发出相关的系统调用，内核会返回两个 file discriber，一个指向写者文件，一个指向读者文件。写者文件只可以写不可读，读者文件反之。当两个进程拥有相同的 fd table 时，就可以“同时”使用这两个 fd。可能一个进程会向写者文件写入数据流，另一个进程可能会从读者文件读出数据流，从而实现进程间数据流的传递。如下图：
 
 #img(
-    image("../assets/image/fs/pipe.svg"),
+    image("../assets/image/fs/pipe.svg", width: 70%),
     caption: "管道原理"
 )

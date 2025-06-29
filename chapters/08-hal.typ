@@ -1,4 +1,4 @@
-= 硬件抽象层
+= 支持RISC-V和Loongarch的硬件抽象层
 
 == 概述
 
@@ -87,9 +87,12 @@ CPU和是否是最后一个退出的CPU，执行相应的操作。例如，第�
 
 == 页表与页分配器
 
-通过名为PageTableHal的特征来规定页表的行为。简而言之，页表主要工作就是建立物理地址到虚拟地址的一对多映射关系，同时为每条映射维护一些权限和状态。
+在操作系统的内存管理子系统中，页表与页分配器是构建虚拟内存机制的核心组件。我们通过精心设计的Rust特征(trait)系统，实现静态约束，保证不同平台的抽象层实现提供相同的接口。实现了跨平台的内存管理抽象层。该设计采用分层架构，将页表操作、页表项管理和物理页分配三个关键功能解耦，同时保持高度的类型安全和性能。
 
-页表项特征
+=== 页表项
+
+页表项特征如下：
+
 ```rust
 pub trait PageTableEntryHal {
     fn new(ppn: PhysPageNum, map_flags: MapFlags) -> Self;
@@ -115,7 +118,12 @@ pub trait PageTableEntryHal {
 }
 ```
 
-页分配器特征
+`PageTableEntryHal`特征定义了页表项的标准行为接口，它完整封装了现代处理器架构中页表项的所有关键属性。该特征包含基本的有效性(`is_valid`)、用户态访问权限(`is_user`)等标志位操作，支持读写执行权限的细粒度控制，实现了写时复制(COW)机制所需的状态位(is_cow)。该特征还通过`is_leaf`方法支持多级页表结构，为不同架构的页表实现提供了统一的抽象接口。
+
+=== 页帧分配器
+
+页分配器特征如下：
+
 ```rust
 pub trait FrameAllocatorHal: Sync {
     fn alloc(&self, cnt: usize) -> Option<Range<PhysPageNum>> {
@@ -132,9 +140,11 @@ pub trait FrameAllocatorTrackerExt: FrameAllocatorHal + Clone {
         )
     }
 }
-
-impl<T: FrameAllocatorHal + Clone> FrameAllocatorTrackerExt for T {}
 ```
+
+物理页分配由`FrameAllocatorHal`特征抽象，它提供了分配(`alloc`)和释放(`dealloc`)物理页的核心操作。通过FrameAllocatorTrackerExt扩展特征，我们实现了RAII风格的FrameTracker包装器，确保物理页在生命周期结束时自动回收，有效防止内存泄漏。
+
+=== 页表
 
 页表特征
 ```rust
@@ -151,11 +161,8 @@ pub trait PageTableHal<PTE: PageTableEntryHal, A: FrameAllocatorHal> {
     unsafe fn enable_low(&self);
 }
 ```
-PageTableHal负责建立映射，PageTableEntryHal用于维护映射条目的权限和状态，FrameAllocatorHal负责提供页表需要的物理内存页。
 
-PageTableHal和PageTableEntryHal的实现默认由HAL提供，HAL通过编译目标选择具体实现。
-
-使用rust的特征实现静态约束，保证不同平台的抽象层实现提供相同的接口。
+页表的核心操作由PageTableHal特征定义，它采用泛型设计，同时约束页表项类型(PTE)和分配器类型(A)。该特征提供了从页表令牌(`token`)初始化的能力(`from_token`)，支持虚拟地址到物理地址的转换(`translate_va`/`translate_vpn`)，以及页表项的查找与修改(find_pte)等关键操作。特别地，`map`和`unmap`方法实现了多级页表的映射管理，而`enable_high`/`enable_low`方法则支持高低地址空间的特权级切换。
 
 == 陷入上下文和中断处理
 
@@ -216,3 +223,46 @@ pub unsafe fn try_write_user(uaddr: *const u8) -> Result<(), TrapType> {
     Ok(())
 }
 ```
+
+== 其他硬件抽象
+
+=== 处理器指令抽象
+
+在操作系统内核开发中，处理器指令的抽象是连接硬件与软件的关键桥梁。我们设计的 InstructionHal trait 对处理器核心指令进行了系统性的抽象和封装。
+
+```rust
+pub trait InstructionHal {
+    unsafe fn tlb_flush_addr(vaddr: usize);
+    unsafe fn tlb_flush_all();
+    unsafe fn enable_interrupt();
+    unsafe fn disable_interrupt();
+    unsafe fn is_interrupt_enabled() -> bool;
+    unsafe fn enable_timer_interrupt();
+    unsafe fn enable_external_interrupt();
+    unsafe fn clear_sum();
+    unsafe fn set_sum();
+    /// shutdown is unsafe, because it will not trigger drop
+    unsafe fn shutdown(failure: bool) -> !;
+    fn hart_start(hartid: usize, opaque: usize);
+    fn set_tp(hartid: usize);
+    fn get_tp() -> usize;
+    fn set_float_status_clean();
+}
+```
+
+=== 定时器抽象
+
+定时器是操作系统实现时间管理和任务调度的核心硬件组件。TimerHal 特征提供了简洁而完备的定时器抽象：
+
+```rust
+pub trait TimerHal {
+    /// get current time
+    fn read() -> usize;
+    /// set next time interrupt
+    fn set_timer(timer: usize);
+    /// get timer freq
+    fn get_timer_freq() -> usize;
+}
+```
+
+
