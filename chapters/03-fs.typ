@@ -299,25 +299,6 @@ ext4（Fourth Extended Filesystem） 是 Linux 上广泛使用的日志型文件
 - _特殊用途_：主要用于系统管理、调试、设备控制和进程间通信，而非持久化存储。
 - _高性能_：由于不涉及磁盘 I/O，访问速度极快（如 tmpfs）。
 
-===  procfs
-
-procfs（进程文件系统）是类Unix系统（如Linux）中一种特殊的虚拟文件系统，它不占用磁盘空间，而是由内核动态生成，以文件系统的形式向用户空间提供内核和进程信息的接口。它通常挂载在`/proc`目录下，是系统监控、调试和性能分析的重要工具。目前 Chronix 支持：
-
-- #strong[`/proc/meminfo`]：输出内存使用情况（总内存、空闲内存、缓存等）
-- #strong[`/proc/self_/exe`]：指向进程的可执行文件（符号链接）
-- #strong[`/proc/mounts`]：记录挂载点
-
-=== devfs
-
-devfs（设备文件系统）是类Unix系统（如Linux）中用于管理设备文件（Device Files）的一种虚拟文件系统。它动态地在`/dev`目录下创建设备节点，使得用户空间程序可以通过标准的文件操作（如open、read、write）与硬件设备交互。
-
-- #strong[`/dev/cpu_dma_latency`]：用户态程序直接向内核请求更积极的 CPU 功耗状态管理策略，以减少 DMA 传输的延迟。
-- #strong[`/dev/null`]：黑洞设备（丢弃所有写入数据）
-- #strong[`/dev/rtc`]：实时时钟设备
-- #strong[`/dev/tty`]：串口设备
-- #strong[`/dev/zero`]：输入输出都为全 0 的设备
-- #strong[`/dev/urandom`]：随机数生成器
-
 === tmpfs
 
 在 Chronix 中，临时文件系统（tmp fs） 和共享内存文件系统（shm fs）的文件都只存在于内存中。由于数据直接存储在内存中，读写操作的速度非常快，没有磁盘 I/O 的开销。`tmpfs` 中的数据在系统重启后会被清除，适合存储临时文件、缓存数据等不需要持久化的内容。`shmfs` 提供了进程间共享内存的机制，使得多个进程可以高效地共享数据，避免了数据复制的开销。内存文件系统可以根据实际使用情况动态调整大小，既不会过度占用内存，也能在需要时自动扩展。内存文件系统作为 VFS 的一个具体实现，完全遵循 VFS 的接口规范，这使得用户程序可以像操作普通文件系统一样操作内存文件系统，保持了良好的一致性和易用性。
@@ -344,6 +325,50 @@ fn cache_write_at(self: Arc<Self>, offset: usize, buf: &[u8]) -> Result<usize, i
 在 linux manual 中，有写到：当 Open flags 为 `O_TMPFILE | O_DIRECTORY` 时，实际的操作是在目标的文件夹下，创建匿名文件。在 Chronix 中，以这种标识打开的文件实际不会放在任何文件夹下，而是唯一地被进程的 `fd table` 持有。
 
 共享内存文件系统（简称为 `shmfs`），目前同等视作 `tmpfs`。
+
+
+===  procfs
+
+procfs（进程文件系统）是类Unix系统（如Linux）中一种特殊的虚拟文件系统，它不占用磁盘空间，而是由内核动态生成，以文件系统的形式向用户空间提供内核和进程信息的接口。它通常挂载在`/proc`目录下，是系统监控、调试和性能分析的重要工具。
+
+在初赛，我们为每一个系统文件都实现了对应的 `File` `Dentry` `Inode` 对象，这种设计带来了大量代码的重复。通过观察可以发现，这类系统文件拥有类似的特点：内容动态生成、只读不写等。我们完全可以复用 `TmpFile` `TmpDentry` 的代码，并实现一个统一的 `Inode`：
+
+```rust
+/// special system file: read only
+pub struct TmpSysInode {
+    inner: InodeInner,
+    content: Arc<dyn InodeContent>,
+}
+
+pub trait InodeContent {
+    fn serialize(&self) -> String;
+}
+```
+我们可以将系统文件的内容抽象成 `InodeContent`，调用其 `serialize` 方法来得到内容转换为的字符串，文件读入则转为为对该动态生成的字符串的读入。
+
+当前进程文件系统支持的文件如下：
+- #strong[`/proc/self/exe`]：指向当前进程正在执行的可执行文件的符号链接
+- #strong[`/proc/self/fd`]：包含当前进程打开的所有文件描述符的目录
+- #strong[`/proc/self/maps`]：展示当前进程的内存映射情况
+- #strong[`/proc/cpuinfo`]：显示 CPU 的详细信息，如型号、核数、频率等
+- #strong[`/proc/meminfo`]：提供系统内存使用情况的统计数据
+- #strong[`/proc/mounts`]：列出当前系统已挂载的所有文件系统
+- #strong[`/proc/interrupt`]：显示系统中断及其被各 CPU 处理的次数
+- #strong[`/proc/sys/kernel/pid_max`]：定义系统允许的最大进程 ID 值
+- #strong[`/proc/sys/kernel/tainted`]：指示内核是否因加载不安全模块或错误而被“污染”
+- #strong[`/proc/sys/fs/pipe-max-size`]：设置或显示单个管道可允许的最大容量（字节数）
+
+=== devfs
+
+devfs（设备文件系统）是类Unix系统（如Linux）中用于管理设备文件（Device Files）的一种虚拟文件系统。它动态地在`/dev`目录下创建设备节点，使得用户空间程序可以通过标准的文件操作（如open、read、write）与硬件设备交互。
+
+- #strong[`/dev/cpu_dma_latency`]：用户态程序直接向内核请求更积极的 CPU 功耗状态管理策略，以减少 DMA 传输的延迟。
+- #strong[`/dev/null`]：黑洞设备（丢弃所有写入数据）
+- #strong[`/dev/rtc`]：实时时钟设备
+- #strong[`/dev/tty`]：串口设备
+- #strong[`/dev/zero`]：输入输出都为全 0 的设备
+- #strong[`/dev/urandom`]：随机数生成器
+- #strong[`/dev/loop0`]：回环设备，把一个普通文件当作块设备（block device）来使用，从而可以像对待硬盘分区一样挂载、格式化或读写这个文件。
 
 == 页缓存
 

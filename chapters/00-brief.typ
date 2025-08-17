@@ -8,7 +8,7 @@ Chronix 是一款现代化的高性能操作系统，专注于异步并发、高
 
 在#strong[内存管理]方面，Chronix 支持了内核空间的动态映射，通过改造 xmas-elf 实现应用的按需加载、写时复制（Copy-on-Write）、懒分配（Lazy Allocation）等优化策略，并全局使用 SLAB 内存分配器，支持零页分配，以最小化内存开销并提升性能。使用了用户指针检查来确保安全性。
 
-#strong[文件系统]方面，Chronix 提供类 Linux 的虚拟文件系统（VFS）架构，支持路径查找缓存（Path Lookup Cache）和页缓存加速文件读写。同时，它兼容多种文件系统，包括 Ext4、Fat32 等磁盘文件系统，以及内存文件系统（tmpfs）、进程文件系统（procfs）和设备文件系统（devfs），并支持灵活的挂载机制。
+#strong[文件系统]方面，Chronix 提供类 Linux 的虚拟文件系统（VFS）架构，支持路径查找缓存（Dentry Cache）和页缓存加速文件读写。同时，它兼容多种文件系统，包括 Ext4、Fat32 等磁盘文件系统，以及内存文件系统（tmpfs）、进程文件系统（procfs）和设备文件系统（devfs），并支持灵活的挂载机制。
 
 Chronix 提供完整的#strong[信号机制]，支持标准信号和实时信号，符合 linux 的信号排队机制，允许用户自定义信号处理逻辑，满足不同应用场景的需求。
 
