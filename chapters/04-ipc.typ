@@ -162,14 +162,146 @@ pub fn recv_sigs_process_level(&self, sig_info: SigInfo)
 + 完成信号的处理
 
 
+== 消息队列
 
+消息队列（`Message Queue`）是一种进程间通信（`IPC`）机制，它允许不相干的进程（可以是无亲缘关系的）通过一个由内核维护的“队列”结构来交换数据（称为“消息”）。消息队列提供了一种异步的通信方式。借助Chronix的异步进程调度模型，Chronix可以实现高效的消息队列通信。
 
+=== 数据结构设计
 
+Chronix 的消息队列的数据结构设计如下：
 
+1. #strong[Message]: 代表队列中的消息，成员包括优先级(`priority`)与数据(`data`)。Message 结构体实现Ord 和 PartialOrd接口使消息可排序。后续用BinaryHeap存储时自动按优先级排列
 
+2. #strong[MqAttr]: 代表队列属性，成员包括消息队列的标志位(`mq_flags`)、消息队列的最大消息数(`mq_maxmsg`)、消息队列的单条消息最大长度(`mq_msgsize`)
 
+3. #strong[MessageQueueInner]: 队列核心状态, 包括双等待队列管理发送/接受任务
+```rust
+pub struct MessageQueueInner {
+    pub attr: MqAttr,                  // 队列属性
+    pub messages: BinaryHeap<Message>, // 消息存储（按优先级排序）
+    sender_wakers: VecDeque<Waker>,    // 发送者等待队列
+    receiver_wakers: VecDeque<Waker>,  // 接收者等待队列
+    pub notify: Option<NotifyRegistration>, // 通知注册
+}
+```
 
+4. #strong[MessageQueue]: 成员包括队列的内部状态(`inner`)以及所有者UID.使用自旋锁 SpinNoIrqLock 保证线程安全
+```rust
+pub struct MessageQueue {
+    pub inner: Arc<SpinNoIrqLock<MessageQueueInner>>, // 线程安全共享
+    pub owner_uid: i32, // 所有者UID
+}
+```
 
+=== 功能实现机制
 
+1. 消息发送机制： 
 
+消息发送部分核心在于`SendFuture`结构, 其包含包含新的消息与对应的消息队列，并实现了Future trait，在`poll`函数中，首先会检查消息队列容量，如果容量已满且可阻塞，则阻塞等待，若非阻塞返回`WouldBlock`错误并在系统调用中进一步处理，否则将消息放入消息队列，并唤醒等待队列中的一个任务。如果队列之前为空，判断是否触发`mq_notify`，进一步发送信号给注册进程。
+
+```rust
+impl Future for SendFuture {
+    type Output = Result<(), MqError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.queue.inner.lock();
+
+        // 1. 检查消息大小是否超过限制
+        if self.message_data.len() > inner.attr.mq_msgsize {
+            return Poll::Ready(Err(MqError::MsgTooBig));
+        }
+
+        // 2. 检查队列是否已满
+        if inner.messages.len() >= inner.attr.mq_maxmsg {
+            if inner.attr.mq_flags & MQ_FLAG_NONBLOCK as i64 != 0 {
+                // 非阻塞模式 → 直接报 WouldBlock
+                return Poll::Ready(Err(MqError::WouldBlock));
+            }
+            // 阻塞模式 → 记录当前任务的 waker
+            inner.push_sender_waker(cx.waker());
+            return Poll::Pending;
+        }
+
+        // 3. 队列有空间，执行真正的发送
+        let was_empty = inner.messages.is_empty();
+        let message = Message {
+            priority: self.message_priority,
+            data: self.message_data.clone(),
+        };
+        inner.messages.push(message);
+
+        // 4. 唤醒等待接收的任务
+        inner.wake_one_receiver();
+
+        // 5. 如果队列之前是空的，触发 mq_notify
+        if was_empty {
+            if let Some(registration) = inner.notify.take() {
+                let sender_task = current_task().unwrap();
+                let sender_pid = sender_task.pid();
+                dispatch_notification(&registration, sender_pid);
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+```
+
+Chronix提供`mq_timedsend`作为发送的api,利用计时部分将介绍的`TimedTaskFuture`实现时间管理机制与mq_send的发送流程结合，实现了超时发送功能。
+
+2. 消息接收机制：
+
+与消息发送类似，提供入口函数`mq_timedreceive`，利用`TimedTaskFuture`实现时间管理机制，实现了超时接收功能。
+
+```rust
+pub async fn mq_timedreceive(
+    &self,
+    timeout: Option<Duration>,
+) -> Result<(Vec<u8>, u32), MqError> {
+    let receive_future = ReceiveFuture { queue: self.clone() };
+
+    match timeout {
+        Some(d) => {
+            match TimedTaskFuture::new(d, receive_future).await {
+                TimedTaskOutput::OK(result) => result,
+                TimedTaskOutput::TimedOut => Err(MqError::TimedOut),
+            }
+        },
+        None => {
+            // 没有超时，直接 await
+            receive_future.await
+        }
+    }
+}
+```
+
+`ReceiveFuture`结构体实现了Future trait，在poll函数中，若队列有信息，取出最高优先级信息，唤醒一个等待的发送者，返回Poll::Ready,携带消息内容与优先级，若消息队列为空，非阻塞直接返回Wouldblock，若阻塞则将当前wker存起来返回Pending等待唤醒。
+
+```rust
+impl Future for ReceiveFuture {
+    type Output = Result<(Vec<u8>, u32), MqError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = self.queue.inner.lock();
+
+        // 1. 队列中有消息
+        if let Some(message) = inner.messages.pop() {
+            // 消息出队
+            inner.wake_one_sender(); // 唤醒一个发送者（因为有空间了）
+            return Poll::Ready(Ok((message.data, message.priority)));
+        } else {
+            // 2. 队列为空
+            if inner.attr.mq_flags & MQ_FLAG_NONBLOCK as i64 != 0 {
+                // 非阻塞模式 → 直接报 WouldBlock
+                return Poll::Ready(Err(MqError::WouldBlock));
+            }
+            // 阻塞模式 → 保存 waker，挂起等待
+            inner.push_receiver_waker(cx.waker());
+            return Poll::Pending;
+        }
+    }
+}
+
+```
 

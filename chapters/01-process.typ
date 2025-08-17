@@ -46,7 +46,7 @@ pub struct TaskControlBlock {
     pub task_status: SpinNoIrqLock<TaskStatus>,
     // ! mutable in self and other tasks
     /// virtual memory space of the task
-    pub vm_space: Shared<UserVmSpace>,
+    pub vm_space: UPSafeCell<Shared<UserVmSpace>>,
     /// parent task
     pub parent: Shared<Option<Weak<TaskControlBlock>>>,
     /// child tasks
@@ -65,6 +65,9 @@ pub struct TaskControlBlock {
     pub cwd: Shared<Arc<dyn Dentry>>,
     /// Interval timers for the task.
     pub itimers: Shared<[ITimer; 3]>,
+    /// posix timers
+    pub posix_timers: Shared<BTreeMap<TimerId, PosixTimer>>,
+    pub next_timer_id: AtomicUsize,
     #[cfg(feature = "smp")]
     /// sche_entity of the task
     pub sche_entity: Shared<TaskLoadTracker>,
@@ -72,6 +75,14 @@ pub struct TaskControlBlock {
     pub cpu_allowed: AtomicUsize,
     /// the processor id of the task
     pub processor_id: AtomicUsize,
+    /// the priority of the task
+    pub priority: AtomicI32,
+    pub ruid: AtomicI32,
+    pub euid: AtomicI32,
+    pub suid: AtomicI32,
+    pub rgid: AtomicI32,
+    pub egid: AtomicI32,
+    pub sgid: AtomicI32,
 }
 ```
 
@@ -103,9 +114,17 @@ Chronix将字段分为若干类：
     - `sig_ucontext_ptr`(任务内信号上下文指针)
     - `cwd`(任务内当前工作目录)
     - `itimers`(任务内间隔定时器)
+    - `posix_timers`(任务内Posix标准定时器)
     - `sche_entity`(任务内调度实体)
     - `cpu_allowed`(任务内允许运行的CPU掩码)
     - `processor_id`(任务内处理器ID)
+    - `priority`(任务内优先级)
+    - `ruid`(任务内有效用户ID)
+    - `euid`(任务内有效组ID)
+    - `suid`(任务内保存用户ID)
+    - `rgid`(任务内有效组ID)
+    - `egid`(任务内有效组ID)
+    - `sgid`(任务内保存组ID)
 
 === 进程&线程的统一与区分
 
@@ -353,7 +372,14 @@ pub fn trap_return(task: &Arc<TaskControlBlock>, _is_intr: bool) {
 === 内核态 => 内核态
 
 // todo: 扩充此部分
-Chronix内核态允许嵌套中断，内核态发生中断后将保存调用者保存的寄存器，调用陷阱处理函数，恢复调用者保存寄存器最终返回。
+Chronix内核态允许嵌套中断，内核态发生中断后将保存调用者保存的寄存器，调用陷阱处理函数，恢复调用者保存寄存器最终返回。内核态中断时Chronix将利用ChronixHal的统一接口作如下操作：
+
+- 保存调用者保存寄存器
+- 调用内核态陷阱处理函数
+- 恢复调用者保存寄存器
+- 返回调用者
+
+具体实现请参考ChronixHal部分。
 
 == 多核心管理
 

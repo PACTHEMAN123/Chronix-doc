@@ -91,3 +91,150 @@ pub struct TimerManager {
 + 安全：采用SpinNoIrqLock`<BinaryHeap<Reverse<Timer>>> `确保定时器调度过程不被中断，保证定时器调度的可靠性
 
 + 触发机制： 同时处理用户态和内核态时间中断，中断触发时自动扫描到期定时器
+
+== 用户态定时器
+<用户态定时器>
+
+基于以上内核定时器机制，Chronix提供多种用户态定时器类型，包括：`ITimer`, `PosixTimer`以及`TimerFd`。
+
+1. #strong[ITimer]（间隔定时器）能够周期性地发送信号给进程，从而实现循环任务的定时执行。则只需对内核计时器进行简单包装即可，其callback实现如下：
+```rust
+fn callback(self: Box<Self>) -> Option<Timer> {
+        self.task.upgrade().and_then(|task| {
+            task.with_mut_itimers(|itimers| {
+                let real_timer = &mut itimers[0];
+                if real_timer.id != self.id {
+                    return None;
+                }
+                /// send signal to task
+                task.recv_sigs_process_level(SigInfo {
+                    si_signo: SIGALRM,
+                    si_code: SigInfo::KERNEL,
+                    si_pid: None,
+                });
+
+                let real_timer_interval = real_timer.interval;
+                if real_timer_interval == Duration::ZERO {
+                    return None;
+                }
+                let next_expire = get_current_time_duration() + real_timer_interval;
+                real_timer.next_expire = next_expire;
+                Some(Timer {
+                    expire: next_expire,
+                    data: self,
+                })
+            })
+        })
+    }
+```
+
+2. #strong[PosixTimer]（Posix标准定时器）是基于timer类型系统调用实现的定时器
+```rust
+pub struct PosixTimer {
+    /// tcb in PosixTimer
+    pub task: Weak<TaskControlBlock>,
+    pub sigevent: Sigevent,
+    pub interval: Duration,
+    pub next_expire: Duration,
+    /// check if has been replace
+    pub interval_id: TimerId,
+    /// last 'sent' signo orverun count
+    pub last_overrun: usize,
+}
+
+```
+相较于ITimer,Posix 定时器提供多种通知方式:
+
+- 信号（Signal）：sigevent中可以选择发送任何实时信号而不仅仅是固定的 SIGALRM。实时信号支持排队，因此即使短时间内多次触发，也不会丢失。
+
+- 线程回调（Thread Callback）：sigevent中可以直接指定一个回调函数，让内核在一个指定的线程中执行它。这种方式更加现代化和安全，尤其是在多线程程序中，避免了信号处理函数的复杂性。
+
+其callback核心逻辑如下：
+
+```rust
+// 仅当当前确实到期（或已过期）才投递信号
+        if now >= self.next_expire {
+            // 计算错过了多少个周期（k-1）
+            if self.interval > Duration::ZERO {
+                let late = now.saturating_sub(self.next_expire);
+                // k = floor(late/interval) + 1   （至少为 1）
+                let k = (late.as_nanos() / self.interval.as_nanos() as u128) as usize + 1;
+                overrun = k.saturating_sub(1);
+                // 刷新下一次到期（跳过多个周期）
+                self.next_expire = self.next_expire + self.interval * (k as u32);
+            } else {
+                // one-shot：下一次到期清零（不再重启）
+                self.next_expire = Duration::ZERO;
+            }
+            // 记录 overrun 到 map，符合 “最近一次已投递信号的 overrun”
+            timer_entry.last_overrun = overrun;
+            // 同步 map 中的 next_expire
+            timer_entry.next_expire = self.next_expire;
+            // 发送信号（仅支持 SIGEV_SIGNAL）
+            match self.sigevent.sigev_notify {
+                SIGEV_SIGNAL => {
+                    let sig_info = SigInfo {
+                        si_signo: self.sigevent.sigev_signo as usize,
+                        si_code: SigInfo::KERNEL,
+                        si_pid: None,
+                    };
+                    task.recv_sigs_process_level(sig_info);
+                }
+                _ => {
+                    log::warn!(
+                        "Unsupported sigev_notify value: {}",
+                        self.sigevent.sigev_notify
+                    );
+                }
+            }
+            // 若为周期定时器，则把“下一次”重新入队；否则结束
+            if self.interval > Duration::ZERO && self.next_expire > Duration::ZERO {
+                // 递归沿用同一 interval_id，直到下一次 settime/disarm 才会递增
+                let next = Timer {
+                    expire: self.next_expire,
+                    data: self,
+                };
+                return Some(next);
+            } else {
+                return None;
+            }
+        }
+        // 未到期则不应被调用（正常不会进入这里；守稳返回 None）。
+        None
+    }
+
+```
+
+3. #strong[TimerFd]（文件描述符定时器）是基于文件描述符实现的定时器，其主要特点是精度高、可靠性高、可移植性好。其功能与`PosixTimer`类似，通过实现`File` trait可以与其他文件系统接口兼容方便管理，并且由于这个特性可以实现异步管理提高性能效率：
+```rust
+fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        let inner = self.timer.lock();
+        // 检查是否有到期事件
+        if inner.expirations > 0 {
+            // 如果有，就绪
+            Poll::Ready(())
+        } else {
+            // 没有到期事件，并且定时器未设置，则立即就绪
+            // 这对应于 timerfd_settime 设置 it_value 为 0 的情况。
+            if inner.next_expire.is_zero() {
+                Poll::Ready(())
+            } else {
+                // 定时器已设置但未到期，我们需要等待
+                // 更新 Waker
+                if self.waker.as_ref().map(|w| !w.will_wake(cx.waker())).unwrap_or(true) {
+                    drop(inner);
+                    self.waker = Some(cx.waker().clone());
+                }
+                // 将 Waker 注册到全局定时器管理器
+                // 确保在到期时会唤醒当前任务
+                // 避免每次 poll 都添加新的定时器。。
+                TIMER_MANAGER.add_timer(Timer::new_waker_timer(
+                    self.timer.lock().next_expire,
+                    cx.waker().clone(),
+                ));
+
+                Poll::Pending
+            }
+        }
+    }
+```
