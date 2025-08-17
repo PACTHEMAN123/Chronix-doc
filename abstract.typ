@@ -2,7 +2,7 @@
 
 #strong[Chronix] 是一个使用 Rust 实现、支持 RISCV-64 和 Loongarch-64 硬件平台的*多核宏内核操作系统*。“Chron” 源自希腊语 “χρόνος”（chronos），意为 “时间”。代表了我们的 OS 具有优异的实时性、强悍的性能。后缀“-ix”致敬类 Unix 系统，代表了我们的 OS 具有兼容性以及开源属性。
 
-截至6月29日23点，Chronix 已经通过初赛的大部分测试点，并在实时排行榜上位于前列：
+#strong[初赛]：截至6月29日23点，Chronix 已经通过初赛的大部分测试点，并在实时排行榜上位于前列：
 
 #img(
     image("assets/leader-board-6-30.png", width: 90%),
@@ -13,6 +13,31 @@
     image("assets/leader-board-rank-6-30.png", width: 90%),
     caption: "6-30 排行榜分数"
 )
+
+#strong[决赛线上测例]：截至8月17日18点，Chronix 已经满分通过全部决赛线上测例：
+
+#img(
+    image("assets/leaderboard-prefinal1.png", width: 90%),
+    caption: "8-17 决赛线上测例排行榜"
+)
+
+#img(
+    image("assets/leaderboard-prefinal2.png", width: 90%),
+    caption: "8-17 决赛线上测例得分"
+)
+
+#strong[决赛初赛用例测试]：截至8月17日18点，Chronix 在初赛测例上的得分提高了近一倍，排名靠前：
+
+#img(
+    image("assets/leaderboard-final-basic1.png", width: 90%),
+    caption: "8-17 初赛测例排名"
+)
+
+#img(
+    image("assets/leaderboard-final-basic2.png", width: 90%),
+    caption: "8-17 初赛测例得分"
+)
+
 
 Chronix 各个模块完成情况如下表：
 
